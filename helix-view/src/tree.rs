@@ -523,7 +523,9 @@ impl Tree {
                                 widths[idx] = widths[idx].saturating_add(1);
                                 remaining -= 1;
                                 idx += 1;
-                                if idx >= len { idx = 0; }
+                                if idx >= len {
+                                    idx = 0;
+                                }
                             }
 
                             let mut child_x = area.x;
@@ -738,7 +740,12 @@ impl Tree {
         None
     }
 
-    pub fn resize_buffer(&mut self, resize_type: Resize, dimension: Dimension, config: &crate::editor::Config) {
+    pub fn resize_buffer(
+        &mut self,
+        resize_type: Resize,
+        dimension: Dimension,
+        config: &crate::editor::Config,
+    ) {
         match dimension {
             Dimension::Width => {
                 let terminal_width = self.area.width;
@@ -756,7 +763,7 @@ impl Tree {
                             } else {
                                 config.max_panel_width
                             };
-                            
+
                             if bounds.width < max_width {
                                 bounds.width += 1;
                             }
@@ -781,7 +788,7 @@ impl Tree {
                             } else {
                                 config.max_panel_height
                             };
-                            
+
                             if bounds.height < max_height {
                                 bounds.height += 1;
                             }
@@ -1136,9 +1143,9 @@ mod test {
         assert_eq!(3, tree.views().count());
         assert_eq!(
             vec![
+                tree_area_width / 3,
                 tree_area_width / 3 - 1, // gap here
                 tree_area_width / 3 - 1, // gap here
-                tree_area_width / 3
             ],
             tree.views()
                 .map(|(view, _)| view.area.width)
@@ -1166,9 +1173,8 @@ mod test {
 
         assert_eq!(10, tree.views().count());
         assert_eq!(
-            std::iter::repeat(7)
-                .take(9)
-                .chain(Some(8)) // Rounding in `recalculate`.
+            std::iter::once(8) // Rounding in `recalculate`.
+                .chain(std::iter::repeat_n(7, 9))
                 .collect::<Vec<_>>(),
             tree.views()
                 .map(|(view, _)| view.area.width)

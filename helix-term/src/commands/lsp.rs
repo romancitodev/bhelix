@@ -16,7 +16,8 @@ use super::{align_view, push_jump, Align, Context, Editor};
 
 use helix_core::{
     diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature,
-    text_annotations::InlineAnnotation, Rope, Selection, Uri,
+    text_annotations::InlineAnnotation, text_folding::ropex::RopeSliceFoldExt, Rope, Selection,
+    Uri,
 };
 use helix_stdx::path;
 use helix_view::{
@@ -29,7 +30,7 @@ use helix_view::{
 };
 
 use crate::{
-    compositor::{self, Compositor, Component},
+    compositor::{self, Component, Compositor},
     job::Callback,
     ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
 };
@@ -859,12 +860,13 @@ fn code_action_inner_picker(
             editor.set_error("No code actions available");
             return;
         }
-        let columns = [ui::PickerColumn::new("action", |item: &CodeActionOrCommandItem, _| {
-            match &item.lsp_item {
+        let columns = [ui::PickerColumn::new(
+            "action",
+            |item: &CodeActionOrCommandItem, _| match &item.lsp_item {
                 lsp::CodeActionOrCommand::CodeAction(action) => action.title.as_str().into(),
                 lsp::CodeActionOrCommand::Command(command) => command.title.as_str().into(),
-            }
-        })];
+            },
+        )];
 
         let picker = ui::Picker::new(
             columns,
@@ -889,8 +891,7 @@ fn code_action_handle_lsp_item(
     lsp_item: &CodeActionOrCommand,
     language_server_id: LanguageServerId,
 ) {
-    let Some(language_server) = editor.language_server_by_id(language_server_id)
-    else {
+    let Some(language_server) = editor.language_server_by_id(language_server_id) else {
         editor.set_error("Language Server disappeared");
         return;
     };
@@ -1289,8 +1290,9 @@ pub fn rename_symbol(cx: &mut Context) {
                             .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
                             .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
                         else {
-                            cx.editor
-                                .set_error("No configured language server supports symbol renaming");
+                            cx.editor.set_error(
+                                "No configured language server supports symbol renaming",
+                            );
                             return;
                         };
 
@@ -1302,9 +1304,10 @@ pub fn rename_symbol(cx: &mut Context) {
 
                         match block_on(future) {
                             Ok(edits) => {
-                                let _ = cx
-                                    .editor
-                                    .apply_workspace_edit(offset_encoding, &edits.unwrap_or_default());
+                                let _ = cx.editor.apply_workspace_edit(
+                                    offset_encoding,
+                                    &edits.unwrap_or_default(),
+                                );
                             }
                             Err(err) => cx.editor.set_error(err.to_string()),
                         }
@@ -1330,8 +1333,9 @@ pub fn rename_symbol(cx: &mut Context) {
                             .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
                             .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
                         else {
-                            cx.editor
-                                .set_error("No configured language server supports symbol renaming");
+                            cx.editor.set_error(
+                                "No configured language server supports symbol renaming",
+                            );
                             return;
                         };
 
@@ -1343,9 +1347,10 @@ pub fn rename_symbol(cx: &mut Context) {
 
                         match block_on(future) {
                             Ok(edits) => {
-                                let _ = cx
-                                    .editor
-                                    .apply_workspace_edit(offset_encoding, &edits.unwrap_or_default());
+                                let _ = cx.editor.apply_workspace_edit(
+                                    offset_encoding,
+                                    &edits.unwrap_or_default(),
+                                );
                             }
                             Err(err) => cx.editor.set_error(err.to_string()),
                         }
@@ -1482,7 +1487,7 @@ fn compute_inlay_hints_for_view(
         .next()?;
 
     let doc_text = doc.text();
-    let len_lines = doc_text.len_lines();
+    let annotations = &view.fold_annotations(doc);
 
     // Compute ~3 times the current view height of inlay hints, that way some scrolling
     // will not show half the view with hints and half without while still being faster
@@ -1492,9 +1497,11 @@ fn compute_inlay_hints_for_view(
     let first_visible_line =
         doc_text.char_to_line(doc.view_offset(view_id).anchor.min(doc_text.len_chars()));
     let first_line = first_visible_line.saturating_sub(view_height);
-    let last_line = first_visible_line
-        .saturating_add(view_height.saturating_mul(2))
-        .min(len_lines);
+    let last_line = doc_text.slice(..).nth_next_folded_line(
+        annotations,
+        first_visible_line,
+        view_height.saturating_mul(2),
+    );
 
     let new_doc_inlay_hints_id = DocumentInlayHintsId {
         first_line,

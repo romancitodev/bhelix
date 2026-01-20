@@ -49,6 +49,8 @@ This fork of Helix implements the following pull requests. Future pull requests 
 23. https://github.com/helix-editor/helix/pull/12902 (File Explorer: create/delete/copy/move/rename)
 24. https://github.com/helix-editor/helix/pull/13963 (auto reload buffers on focus / changes)
 25. https://github.com/helix-editor/helix/pull/14825 (soft-wrap indicators in gutter)
+26. https://github.com/helix-editor/helix/pull/11695 (Add ability to match in next and previous char pairs)
+27. https://github.com/helix-editor/helix/pull/14593 (code folding)
 
 ## Setup
 
@@ -509,3 +511,29 @@ periodic.interval = 5000
 focus-gained = true
 periodic.enable = true
 periodic.interval = 5000
+
+## File Picker Configuration
+
+**Hide Preview:**
+
+You can choose to hide the file preview in the file picker to save screen space or improve performance.
+
+```toml
+[editor.file-picker]
+hide-preview = true
+```
+
+## Code Folding
+
+**Code Folding Commands:**
+- `fold` - Fold text objects
+- `unfold` - Unfold text objects
+- `toggle_fold` - Toggle fold for the text object at the primary cursor
+
+**Configuration:**
+To automatically fold specific text objects when a document is opened:
+
+```toml
+[editor]
+fold-textobjects = ["comment"] # Example: fold all comments on open
+```

@@ -12,6 +12,7 @@ use helix_core::encoding::Encoding;
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
+use helix_core::text_folding::{EndFoldPoint, FoldContainer, StartFoldPoint};
 use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
@@ -138,6 +139,20 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginAnnotation {
+    pub char_idx: usize,
+    pub text: String,
+    pub style: Option<String>,
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub offset: u16,
+    pub is_line: bool,
+    /// For virtual lines: which row index this belongs to (0-indexed).
+    /// Multiple annotations with the same virt_line_idx will render on the same virtual line.
+    pub virt_line_idx: Option<u16>,
+}
+
 pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
@@ -150,6 +165,8 @@ pub struct Document {
     /// To know if they're up-to-date, check the `id` field in `DocumentInlayHints`.
     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
+    pub plugin_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
+    fold_container: HashMap<ViewId, FoldContainer>,
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
     /// update from the LSP
     pub inlay_hints_oudated: bool,
@@ -335,6 +352,7 @@ impl fmt::Debug for Document {
             .field("modified_since_accessed", &self.modified_since_accessed)
             .field("diagnostics", &self.diagnostics)
             // .field("language_server", &self.language_server)
+            .field("fold_container", &self.fold_container)
             .finish()
     }
 }
@@ -722,6 +740,7 @@ impl Document {
             text,
             selections: HashMap::default(),
             inlay_hints: HashMap::default(),
+            fold_container: HashMap::default(),
             inlay_hints_oudated: false,
             view_data: Default::default(),
             indent_style: DEFAULT_INDENT,
@@ -746,6 +765,7 @@ impl Document {
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
+            plugin_annotations: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
             is_welcome: false,
@@ -1369,6 +1389,15 @@ impl Document {
         // TODO: use a transaction?
         self.selections
             .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
+
+        if let Some((container, selection)) = self
+            .fold_container
+            .get_mut(&view_id)
+            .zip(self.selections.get(&view_id))
+        {
+            container.remove_by_selection(self.text.slice(..), selection)
+        }
+
         helix_event::dispatch(SelectionDidChange {
             doc: self,
             view: view_id,
@@ -1439,14 +1468,10 @@ impl Document {
 
         if changes.is_empty() {
             if let Some(selection) = transaction.selection() {
-                self.selections.insert(
+                self.set_selection(
                     view_id,
                     selection.clone().ensure_invariants(self.text.slice(..)),
                 );
-                helix_event::dispatch(SelectionDidChange {
-                    doc: self,
-                    view: view_id,
-                });
             }
             return true;
         }
@@ -1454,13 +1479,23 @@ impl Document {
         self.modified_since_accessed = true;
         self.version += 1;
 
-        for selection in self.selections.values_mut() {
-            *selection = selection
+        for container in self.fold_container.values_mut() {
+            container.update_by_transaction(self.text.slice(..), old_doc.slice(..), transaction);
+        }
+
+        for (id, selection) in &mut self.selections {
+            let ensured_selection = selection
                 .clone()
                 // Map through changes
                 .map(transaction.changes())
                 // Ensure all selections across all views still adhere to invariants.
                 .ensure_invariants(self.text.slice(..));
+
+            if let Some(container) = self.fold_container.get_mut(id) {
+                container.remove_by_selection(self.text.slice(..), &ensured_selection);
+            }
+
+            *selection = ensured_selection;
         }
 
         for view_data in self.view_data.values_mut() {
@@ -1476,6 +1511,9 @@ impl Document {
                 .retain_mut(|save_point| match save_point.upgrade() {
                     Some(savepoint) => {
                         let mut revert_to_savepoint = savepoint.revert.lock();
+                        if revert.changes().len_after() != revert_to_savepoint.changes().len() {
+                            return true;
+                        }
                         *revert_to_savepoint =
                             revert.clone().compose(mem::take(&mut revert_to_savepoint));
                         true
@@ -1581,14 +1619,10 @@ impl Document {
 
         // if specified, the current selection should instead be replaced by transaction.selection
         if let Some(selection) = transaction.selection() {
-            self.selections.insert(
+            self.set_selection(
                 view_id,
                 selection.clone().ensure_invariants(self.text.slice(..)),
             );
-            helix_event::dispatch(SelectionDidChange {
-                doc: self,
-                view: view_id,
-            });
         }
 
         true
@@ -1611,10 +1645,30 @@ impl Document {
 
         let success = self.apply_impl(transaction, view_id, emit_lsp_notification);
 
-        if !transaction.changes().is_empty() {
-            // Compose this transaction with the previous one
+        if success && !transaction.changes().is_empty() {
+            // Compose this transaction with the previous one.
+            // We handle recursion by checking if the existing changes happened
+            // BEFORE or AFTER this one.
             take_with(&mut self.changes, |changes| {
-                changes.compose(transaction.changes().clone())
+                if changes.is_empty() {
+                    return transaction.changes().clone();
+                }
+
+                // If transaction's after matches changes' before, it's normal sequential.
+                if changes.len_after() == transaction.changes().len() {
+                    return changes.compose(transaction.changes().clone());
+                }
+
+                // If transaction's after matches current changes' before,
+                // transaction is L0 -> L1, current is L1 -> L2.
+                // It means this transaction happened logically first (recursion).
+                if transaction.changes().len_after() == changes.len() {
+                    return transaction.changes().clone().compose(changes);
+                }
+
+                // Fallback: something is wrong (mismatch), keep current to avoid panic.
+                log::warn!("Composition skipped due to unexpected length mismatch: prev_after={}, txn_before={}, txn_after={}, curr_len={}", changes.len_after(), transaction.changes().len(), transaction.changes().len_after(), changes.len());
+                changes
             });
         }
         success
@@ -1625,7 +1679,7 @@ impl Document {
     }
 
     /// Get the line blame for this view
-    pub fn line_blame(&self, cursor_line: u32, format: &str) -> Result<String, LineBlameError> {
+    pub fn line_blame(&self, cursor_line: u32, format: &str) -> Result<String, LineBlameError<'_>> {
         // how many lines were inserted and deleted before the cursor line
         let (inserted_lines, deleted_lines) = self
             .diff_handle()
@@ -2399,6 +2453,59 @@ impl Document {
 
     pub fn has_language_server_with_feature(&self, feature: LanguageServerFeature) -> bool {
         self.language_servers_with_feature(feature).next().is_some()
+    }
+
+    pub fn insert_fold_container(&mut self, view_id: ViewId, container: FoldContainer) {
+        self.fold_container.insert(view_id, container);
+    }
+
+    /// `None` when container is empty.
+    pub fn fold_container(&self, view_id: ViewId) -> Option<&FoldContainer> {
+        self.fold_container.get(&view_id)
+    }
+
+    fn add_folds_impl(
+        &mut self,
+        view: &View,
+        fold_points: Vec<(StartFoldPoint, EndFoldPoint)>,
+        replace: bool,
+    ) {
+        let text = self.text.slice(..);
+        let range = self.selection(view.id).primary();
+        let container = self.fold_container.entry(view.id).or_default();
+
+        if replace {
+            container.replace(text, fold_points);
+        } else {
+            container.add(text, fold_points);
+        }
+
+        let range = container.throw_range_out_of_folds(text, range);
+        self.set_selection(view.id, Selection::single(range.anchor, range.head));
+
+        let scrolloff = self.config.load().scrolloff;
+        view.ensure_cursor_in_view(self, scrolloff);
+    }
+
+    pub fn add_folds(&mut self, view: &View, fold_points: Vec<(StartFoldPoint, EndFoldPoint)>) {
+        self.add_folds_impl(view, fold_points, false);
+    }
+
+    pub fn replace_folds(&mut self, view: &View, fold_points: Vec<(StartFoldPoint, EndFoldPoint)>) {
+        self.add_folds_impl(view, fold_points, true);
+    }
+
+    pub fn remove_folds(&mut self, view: &View, start_indices: Vec<usize>) {
+        let text = self.text.slice(..);
+        let container = self
+            .fold_container
+            .get_mut(&view.id)
+            .expect("Container must be initialized");
+
+        container.remove(text, start_indices);
+
+        let scrolloff = self.config.load().scrolloff;
+        view.ensure_cursor_in_view(self, scrolloff);
     }
 }
 

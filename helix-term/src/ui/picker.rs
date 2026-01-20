@@ -8,10 +8,10 @@ use crate::{
     ui::{
         self,
         document::{render_document, LinePos, TextRenderer},
+        gradient_border::GradientBorder,
         picker::query::PickerQuery,
         text_decorations::DecorationManager,
         EditorView,
-        gradient_border::GradientBorder,
     },
 };
 use futures_util::future::BoxFuture;
@@ -268,10 +268,10 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     preview_cache: HashMap<Arc<Path>, CachedPreview>,
     read_buffer: Vec<u8>,
     /// Given an item in the picker, return the file path and line number to display.
-    file_fn: Option<FileCallback<T>>, 
+    file_fn: Option<FileCallback<T>>,
     /// An event handler for syntax highlighting the currently previewed file.
-    preview_highlight_handler: Sender<Arc<Path>>, 
-    dynamic_query_handler: Option<Sender<DynamicQueryChange>>, 
+    preview_highlight_handler: Sender<Arc<Path>>,
+    dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
     /// Cached gradient border for rendering when enabled in config
     gradient_border: Option<GradientBorder>,
 }
@@ -434,6 +434,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_history_register(mut self, history_register: Option<char>) -> Self {
         self.prompt.with_history_register(history_register);
+        self
+    }
+
+    pub fn show_preview(mut self, show_preview: bool) -> Self {
+        self.show_preview = show_preview;
         self
     }
 
@@ -625,7 +630,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 let preview = std::fs::metadata(&path)
                     .and_then(|metadata| {
                         if metadata.is_dir() {
-                            let files = super::directory_content(&path)?;
+                            let files = super::directory_content(&path, editor)?;
                             let file_names: Vec<_> = files
                                 .iter()
                                 .filter_map(|(path, is_dir)| {
@@ -961,7 +966,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
                 Some(doc)
-                    if range.map_or(true, |(start, end)| {
+                    if range.is_none_or(|(start, end)| {
                         start <= end && end <= doc.text().len_lines()
                     }) =>
                 {
@@ -1021,8 +1026,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
             let loader = cx.editor.syn_loader.load();
 
-            let syntax_highlighter =
-                EditorView::doc_syntax_highlighter(doc, offset.anchor, area.height, &loader);
+            let syntax_highlighter = EditorView::doc_syntax_highlighter(
+                doc,
+                &TextAnnotations::default(),
+                offset.anchor,
+                area.height,
+                &loader,
+            );
             let mut overlay_highlights = Vec::new();
 
             EditorView::doc_diagnostics_highlights_into(

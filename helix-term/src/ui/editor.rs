@@ -8,7 +8,10 @@ use crate::{
     ui::{
         document::{render_document, LinePos, TextRenderer},
         statusline,
-        text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
+        text_decorations::{
+            self, Decoration, DecorationManager, FoldDecoration, InlineDiagnostics,
+            PluginDecoration,
+        },
         Completion, NotificationPopup, ProgressSpinners,
     },
 };
@@ -19,19 +22,24 @@ use helix_core::{
     movement::Direction,
     syntax::{self, OverlayHighlights},
     text_annotations::TextAnnotations,
+    text_folding::RopeSliceFoldExt,
     unicode::width::UnicodeWidthStr,
     visual_offset_from_block, Change, Position, Range, Selection, Transaction,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
-    annotations::diagnostics::DiagnosticFilter,
+    // annotations::diagnostics::DiagnosticFilter,
     document::{Mode, SCRATCH_BUFFER_NAME},
     editor::{CompleteAction, CursorShapeConfig, InlineBlameConfig, InlineBlameShow},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     icons::ICONS,
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, DocumentId, Editor, Theme, View,
+    Document,
+    DocumentId,
+    Editor,
+    Theme,
+    View,
 };
 use std::{
     mem::take,
@@ -380,6 +388,8 @@ impl EditorView {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
         }
 
+        decorations.add_decoration(FoldDecoration::new(&text_annotations, theme));
+
         if is_focused && config.cursorcolumn {
             Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
         }
@@ -398,8 +408,13 @@ impl EditorView {
             decorations.add_decoration(line_decoration);
         }
 
-        let syntax_highlighter =
-            Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+        let syntax_highlighter = Self::doc_syntax_highlighter(
+            doc,
+            &text_annotations,
+            view_offset.anchor,
+            inner.height,
+            &loader,
+        );
         let mut overlays = Vec::new();
 
         overlays.push(Self::overlay_syntax_highlights(
@@ -414,9 +429,14 @@ impl EditorView {
             .and_then(|config| config.rainbow_brackets)
             .unwrap_or(config.rainbow_brackets)
         {
-            if let Some(overlay) =
-                Self::doc_rainbow_highlights(doc, view_offset.anchor, inner.height, theme, &loader)
-            {
+            if let Some(overlay) = Self::doc_rainbow_highlights(
+                doc,
+                &text_annotations,
+                view_offset.anchor,
+                inner.height,
+                theme,
+                &loader,
+            ) {
                 overlays.push(overlay);
             }
         }
@@ -488,6 +508,8 @@ impl EditorView {
             config.end_of_line_diagnostics,
         ));
 
+        decorations.add_decoration(PluginDecoration::new(doc, theme, view.id));
+
         render_document(
             surface,
             inner,
@@ -500,8 +522,7 @@ impl EditorView {
             decorations,
         );
 
-        // Draw rulers after document so background-style shows behind text and
-        // glyph-style can selectively draw on blank cells without being overwritten.
+        // Draw rulers after document. Skip cells that already have content.
         Self::render_rulers(editor, doc, view, inner, surface, theme);
 
         // if we're not at the edge of the screen, draw a right border
@@ -516,17 +537,15 @@ impl EditorView {
             }
         }
 
-        if config.inline_diagnostics.disabled()
-            && config.end_of_line_diagnostics == DiagnosticFilter::Disable
-        {
-            Self::render_diagnostics(doc, view, inner, surface, theme);
-        }
+        // if config.inline_diagnostics.disabled()
+        //     && config.end_of_line_diagnostics == DiagnosticFilter::Disable
+        // {
+        //     Self::render_diagnostics(doc, view, inner, surface, theme);
+        // }
 
         // Statusline on the last row of the view area.
         // The cmdline space reservation is handled at the top level in EditorView::render.
-        let statusline_area = view
-            .area
-            .clip_top(view.area.height.saturating_sub(1));
+        let statusline_area = view.area.clip_top(view.area.height.saturating_sub(1));
 
         let mut context =
             statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
@@ -600,9 +619,7 @@ impl EditorView {
         let editor_rulers = &editor.config().rulers;
         let ruler_char = &editor.config().ruler_char;
         // Base style from theme for rulers
-        let base_style = theme
-            .try_get("ui.virtual.ruler")
-            .unwrap_or_else(|| Style::default());
+        let base_style = theme.try_get("ui.virtual.ruler").unwrap_or_default();
         // Background style is used only for background-style rulers. If theme lacks a bg, reuse fg.
         let bg_style = if base_style.bg.is_none() {
             if let Some(fg) = base_style.fg {
@@ -631,21 +648,29 @@ impl EditorView {
             .map(|ruler| viewport.clip_left(ruler).with_width(1))
             .for_each(|area| {
                 if ruler_char.is_empty() {
-                    // Background-style ruler (legacy behavior)
-                    surface.set_style(area, bg_style);
+                    // Background-style ruler: only apply to cells without content
+                    for y in area.top()..area.bottom() {
+                        let cell = &surface[(area.x, y)];
+                        // Skip cells that have non-whitespace content (like diagnostic bubbles)
+                        if cell.symbol == " " || cell.symbol.is_empty() {
+                            surface[(area.x, y)].set_style(bg_style);
+                        }
+                    }
                 } else {
-                    // Foreground glyph ruler: draw the configured character on each visible row
-                    // Do NOT force a background color here to avoid making the glyph invisible
-                    // when fg == bg in the theme.
+                    // Foreground glyph ruler: only draw on empty/space cells
                     let mut glyph_style = base_style;
                     glyph_style.bg = None;
                     if glyph_style.fg.is_none() {
                         glyph_style = glyph_style.fg(Color::Gray);
                     }
                     for y in area.top()..area.bottom() {
-                        surface[(area.x, y)]
-                            .set_symbol(ruler_char)
-                            .set_style(glyph_style);
+                        let cell = &surface[(area.x, y)];
+                        // Only draw ruler glyph on empty/space cells to avoid overwriting content
+                        if cell.symbol == " " || cell.symbol.is_empty() {
+                            surface[(area.x, y)]
+                                .set_symbol(ruler_char)
+                                .set_style(glyph_style);
+                        }
                     }
                 }
             })
@@ -653,13 +678,16 @@ impl EditorView {
 
     fn viewport_byte_range(
         text: helix_core::RopeSlice,
+        annotations: &TextAnnotations,
         row: usize,
         height: u16,
     ) -> std::ops::Range<usize> {
         // Calculate viewport byte ranges:
         // Saturating subs to make it inclusive zero indexing.
         let last_line = text.len_lines().saturating_sub(1);
-        let last_visible_line = (row + height as usize).saturating_sub(1).min(last_line);
+        let last_visible_line = text
+            .nth_next_folded_line(&annotations.folds, row, (height as usize).saturating_sub(1))
+            .min(last_line);
         let start = text.line_to_byte(row.min(last_line));
         let end = text.line_to_byte(last_visible_line + 1);
 
@@ -671,6 +699,7 @@ impl EditorView {
     /// directly to enable rendering syntax highlighted docs anywhere (eg. picker preview)
     pub fn doc_syntax_highlighter<'editor>(
         doc: &'editor Document,
+        annotations: &TextAnnotations,
         anchor: usize,
         height: u16,
         loader: &'editor syntax::Loader,
@@ -678,7 +707,7 @@ impl EditorView {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
-        let range = Self::viewport_byte_range(text, row, height);
+        let range = Self::viewport_byte_range(text, annotations, row, height);
         let range = range.start as u32..range.end as u32;
 
         let highlighter = syntax.highlighter(text, loader, range);
@@ -694,7 +723,7 @@ impl EditorView {
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
 
-        let mut range = Self::viewport_byte_range(text, row, height);
+        let mut range = Self::viewport_byte_range(text, text_annotations, row, height);
         range = text.byte_to_char(range.start)..text.byte_to_char(range.end);
 
         text_annotations.collect_overlay_highlights(range)
@@ -702,6 +731,7 @@ impl EditorView {
 
     pub fn doc_rainbow_highlights(
         doc: &Document,
+        annotations: &TextAnnotations,
         anchor: usize,
         height: u16,
         theme: &Theme,
@@ -710,7 +740,7 @@ impl EditorView {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
-        let visible_range = Self::viewport_byte_range(text, row, height);
+        let visible_range = Self::viewport_byte_range(text, annotations, row, height);
         let start = syntax::child_for_byte_range(
             &syntax.tree().root_node(),
             visible_range.start as u32..visible_range.end as u32,
@@ -1033,21 +1063,22 @@ impl EditorView {
         }
 
         // Determine scroll offset
-        let scroll_offset = if let Some(current_idx) = editor.documents().position(|d| d.id() == current_doc) {
-            if let Some(&target_x) = self.bufferline_positions.get(current_idx) {
-                if target_x >= viewport.width / 2 {
-                    target_x
-                        .saturating_sub(viewport.width / 2)
-                        .min(total_width.saturating_sub(viewport.width))
+        let scroll_offset =
+            if let Some(current_idx) = editor.documents().position(|d| d.id() == current_doc) {
+                if let Some(&target_x) = self.bufferline_positions.get(current_idx) {
+                    if target_x >= viewport.width / 2 {
+                        target_x
+                            .saturating_sub(viewport.width / 2)
+                            .min(total_width.saturating_sub(viewport.width))
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 }
             } else {
                 0
-            }
-        } else {
-            0
-        };
+            };
 
         // Second pass: render with the calculated offset
         for (idx, doc) in editor.documents().enumerate() {
@@ -1057,10 +1088,18 @@ impl EditorView {
             // Render separator if not first document
             if idx > 0 {
                 let sep = &editor.config().bufferline.separator;
-                let sep_x = buffer_x.saturating_sub(sep.len() as u16).saturating_sub(scroll_offset);
+                let sep_x = buffer_x
+                    .saturating_sub(sep.len() as u16)
+                    .saturating_sub(scroll_offset);
                 if sep_x < viewport.width {
                     let render_x = viewport.x + sep_x;
-                    surface.set_stringn(render_x, viewport.y, sep, (viewport.width - sep_x) as usize, bufferline_inactive);
+                    surface.set_stringn(
+                        render_x,
+                        viewport.y,
+                        sep,
+                        (viewport.width - sep_x) as usize,
+                        bufferline_inactive,
+                    );
                 }
             }
 
@@ -1104,8 +1143,10 @@ impl EditorView {
 
             // Track buffer info for mouse clicks (adjust for scroll offset)
             let start_x = actual_render_x;
-            let end_x = (actual_render_x + visible_text.len() as u16).min(viewport.x + viewport.width);
-            self.bufferline_info.add_buffer_info(doc.id(), start_x..end_x);
+            let end_x =
+                (actual_render_x + visible_text.len() as u16).min(viewport.x + viewport.width);
+            self.bufferline_info
+                .add_buffer_info(doc.id(), start_x..end_x);
         }
     }
 
@@ -1431,6 +1472,9 @@ impl EditorView {
                 }
             }
             KeymapResult::NotFound | KeymapResult::Cancelled(_) => return Some(key_result),
+            KeymapResult::Fallback(fallback, ch) => {
+                fallback.execute(cxt, *ch);
+            }
         }
         None
     }
@@ -1683,7 +1727,9 @@ impl EditorView {
                 let config = editor.config();
                 let bufferline_visible = match config.bufferline.render_mode {
                     helix_view::editor::BufferLineRenderMode::Always => true,
-                    helix_view::editor::BufferLineRenderMode::Multiple => editor.documents.len() > 1,
+                    helix_view::editor::BufferLineRenderMode::Multiple => {
+                        editor.documents.len() > 1
+                    }
                     _ => false,
                 };
                 if bufferline_visible && row == 0 {
@@ -1903,6 +1949,7 @@ impl Component for EditorView {
             callback: Vec::new(),
             on_next_key_callback: None,
             jobs: context.jobs,
+            plugin_manager: context.plugin_manager.clone(),
         };
 
         match event {
@@ -1951,6 +1998,7 @@ impl Component for EditorView {
                                         editor: cx.editor,
                                         jobs: cx.jobs,
                                         scroll: None,
+                                        plugin_manager: cx.plugin_manager.clone(),
                                     };
 
                                     if let EventResult::Consumed(callback) =
@@ -2038,22 +2086,21 @@ impl Component for EditorView {
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
-                if context.editor.config().auto_reload.focus_gained {
-                    if crate::handlers::auto_reload::count_externally_modified_documents(
+                if context.editor.config().auto_reload.focus_gained
+                    && crate::handlers::auto_reload::count_externally_modified_documents(
                         context.editor.documents(),
                     ) > 0
-                    {
-                        if let Err(e) = commands::typed::reload_all(
-                            context,
-                            helix_core::command_line::Args::default(),
-                            super::PromptEvent::Validate,
-                        ) {
-                            context.editor.set_error(format!("{}", e));
-                        } else {
-                            context
-                                .editor
-                                .set_status("Reloaded files due to external changes");
-                        }
+                {
+                    if let Err(e) = commands::typed::reload_all(
+                        context,
+                        helix_core::command_line::Args::default(),
+                        super::PromptEvent::Validate,
+                    ) {
+                        context.editor.set_error(format!("{}", e));
+                    } else {
+                        context
+                            .editor
+                            .set_status("Reloaded files due to external changes");
                     }
                 }
                 self.terminal_focused = true;
@@ -2097,7 +2144,7 @@ impl Component for EditorView {
         } else {
             area.clip_bottom(1) // Reserve for commandline
         };
-        
+
         if use_bufferline {
             editor_area = editor_area.clip_top(1);
         }
@@ -2186,21 +2233,18 @@ impl Component for EditorView {
 
         // Cleanup expired notifications before rendering
         cx.editor.cleanup_notifications();
-        
+
         // Render notification popup
         self.notification_popup.render(area, surface, cx);
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        match editor.cursor() {
-            (pos, kind) => {
-                if self.terminal_focused {
-                    (pos, kind)
-                } else {
-                    // use underline cursor when terminal loses focus for visibility
-                    (pos, CursorKind::Underline)
-                }
-            }
+        let (pos, kind) = editor.cursor();
+        if self.terminal_focused {
+            (pos, kind)
+        } else {
+            // use underline cursor when terminal loses focus for visibility
+            (pos, CursorKind::Underline)
         }
     }
 }
@@ -2235,7 +2279,6 @@ struct BufferInfo {
     // The bufferline column span used to show the document name
     columns: std::ops::Range<u16>,
 }
-
 
 fn canonicalize_key(key: &mut KeyEvent) {
     if let KeyEvent {

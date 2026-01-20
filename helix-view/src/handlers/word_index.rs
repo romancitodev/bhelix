@@ -6,7 +6,8 @@
 use std::{borrow::Cow, collections::HashMap, iter, mem, sync::Arc, time::Duration};
 
 use helix_core::{
-    chars::char_is_word, fuzzy::fuzzy_match, movement, ChangeSet, Range, Rope, RopeSlice,
+    chars::char_is_word, fuzzy::fuzzy_match, movement, text_annotations::TextAnnotations,
+    ChangeSet, Range, Rope, RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook};
 use helix_stdx::rope::RopeSliceExt as _;
@@ -85,8 +86,12 @@ impl AsyncHook for Hook {
                 if let Some(pending_change) = self.changes.get_mut(&doc) {
                     // If there is already a change waiting for this document, merge the two
                     // changes together by composing the changesets and saving the new `text`.
-                    pending_change.changes =
-                        mem::take(&mut pending_change.changes).compose(change.changes);
+                    let pending = mem::take(&mut pending_change.changes);
+                    pending_change.changes = if pending.len_after() == change.changes.len() {
+                        pending.compose(change.changes)
+                    } else {
+                        change.changes
+                    };
                     pending_change.text = change.text;
                     Some(Instant::now() + DEBOUNCE)
                 } else if !is_changeset_significant(&change.changes) {
@@ -263,7 +268,8 @@ fn words(text: RopeSlice) -> impl Iterator<Item = RopeSlice> {
         .get_char(cursor.anchor)
         .is_some_and(|ch| !ch.is_whitespace())
     {
-        let cursor_word_end = movement::move_next_word_end(text, cursor, 1);
+        let cursor_word_end =
+            movement::move_next_word_end(text, &TextAnnotations::default(), cursor, 1);
         if cursor_word_end.anchor == 0 {
             cursor = cursor_word_end;
         }
@@ -290,7 +296,7 @@ fn words(text: RopeSlice) -> impl Iterator<Item = RopeSlice> {
                 }
             }
             let head = cursor.head;
-            cursor = movement::move_next_word_end(text, cursor, 1);
+            cursor = movement::move_next_word_end(text, &TextAnnotations::default(), cursor, 1);
             if cursor.head == head {
                 cursor.head = usize::MAX;
             }
