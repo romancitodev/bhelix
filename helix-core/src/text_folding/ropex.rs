@@ -358,29 +358,24 @@ impl<'a, Items: TextItems<'a>> FoldedTextItems<'a, Items> {
             return None;
         }
 
-        self.idx -= 1;
-        if let Some(position) = Items::consume_prev(self.annotations, self.idx) {
+        // Check if there's a fold ending at the current position.
+        // We look at the byte/char immediately preceding the current index.
+        if let Some(position) = Items::consume_prev(self.annotations, self.idx - 1) {
             self.idx = position;
             self.items = Items::at(self.slice, self.idx);
 
             return self.prev_impl();
         }
 
+        let item = self.items.prev_impl()?;
+
+        self.idx -= Items::len_of(&item);
         self.last_idx = Some(self.idx);
 
-        Some(
-            self.items
-                .prev_impl()
-                .expect("The `idx` field must equal the item index."),
-        )
+        Some(item)
     }
 
     fn next_impl(&mut self) -> Option<Items::Item> {
-        if self.idx == Items::len(self.slice) {
-            self.last_idx = None;
-            return None;
-        }
-
         if let Some(position) = Items::consume_next(self.annotations, self.idx) {
             self.idx = position + 1;
             self.items = Items::at(self.slice, self.idx);
@@ -388,15 +383,12 @@ impl<'a, Items: TextItems<'a>> FoldedTextItems<'a, Items> {
             return self.next_impl();
         }
 
+        let item = self.items.next_impl()?;
+
         self.last_idx = Some(self.idx);
+        self.idx += Items::len_of(&item);
 
-        let result = self
-            .items
-            .next_impl()
-            .expect("The `idx` field must equal the item index.");
-        self.idx += 1;
-
-        Some(result)
+        Some(item)
     }
 }
 
@@ -416,11 +408,11 @@ impl<'a, Items: TextItems<'a>> Iterator for FoldedTextItems<'a, Items> {
 trait TextItems<'a>: Iterator {
     fn at(slice: RopeSlice<'a>, idx: usize) -> Self;
     fn reset_pos(annotations: &FoldAnnotations, idx: usize);
-    fn len(slice: RopeSlice) -> usize;
     fn prev_impl(&mut self) -> Option<Self::Item>;
     fn next_impl(&mut self) -> Option<Self::Item>;
     fn consume_prev(annotations: &FoldAnnotations, idx: usize) -> Option<usize>;
     fn consume_next(annotations: &FoldAnnotations, idx: usize) -> Option<usize>;
+    fn len_of(item: &Self::Item) -> usize;
 }
 
 impl<'a> TextItems<'a> for Chars<'a> {
@@ -430,10 +422,6 @@ impl<'a> TextItems<'a> for Chars<'a> {
 
     fn reset_pos(annotations: &FoldAnnotations, char_idx: usize) {
         annotations.reset_pos(char_idx, |fold| fold.start.char)
-    }
-
-    fn len(slice: RopeSlice) -> usize {
-        slice.len_chars()
     }
 
     fn prev_impl(&mut self) -> Option<Self::Item> {
@@ -455,6 +443,10 @@ impl<'a> TextItems<'a> for Chars<'a> {
             .consume_next(char_idx, |fold| fold.start.char)
             .map(|fold| fold.end.char)
     }
+
+    fn len_of(_item: &Self::Item) -> usize {
+        1
+    }
 }
 
 impl<'a> TextItems<'a> for RopeGraphemes<'a> {
@@ -464,10 +456,6 @@ impl<'a> TextItems<'a> for RopeGraphemes<'a> {
 
     fn reset_pos(annotations: &FoldAnnotations, byte_idx: usize) {
         annotations.reset_pos(byte_idx, |fold| fold.start.byte)
-    }
-
-    fn len(slice: RopeSlice) -> usize {
-        slice.len_bytes()
     }
 
     fn prev_impl(&mut self) -> Option<Self::Item> {
@@ -489,6 +477,10 @@ impl<'a> TextItems<'a> for RopeGraphemes<'a> {
             .consume_next(byte_idx, |fold| fold.start.byte)
             .map(|fold| fold.end.byte)
     }
+
+    fn len_of(item: &Self::Item) -> usize {
+        item.len_bytes()
+    }
 }
 
 impl<'a> TextItems<'a> for Lines<'a> {
@@ -498,10 +490,6 @@ impl<'a> TextItems<'a> for Lines<'a> {
 
     fn reset_pos(annotations: &FoldAnnotations, line_idx: usize) {
         annotations.reset_pos(line_idx, |fold| fold.start.line)
-    }
-
-    fn len(slice: RopeSlice) -> usize {
-        slice.len_lines()
     }
 
     fn prev_impl(&mut self) -> Option<Self::Item> {
@@ -522,5 +510,9 @@ impl<'a> TextItems<'a> for Lines<'a> {
         annotations
             .consume_next(line_idx, |fold| fold.start.line)
             .map(|fold| fold.end.line)
+    }
+
+    fn len_of(_item: &Self::Item) -> usize {
+        1
     }
 }
