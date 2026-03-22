@@ -9,6 +9,7 @@ use termina::{
     escape::{
         csi::{self, Csi, SgrAttributes, SgrModifiers},
         dcs::{self, Dcs},
+        osc::{self, Osc},
     },
     style::{CursorStyle, RgbColor},
     Event, OneBased, PlatformTerminal, Terminal as _, WindowSize,
@@ -52,6 +53,8 @@ struct Capabilities {
     synchronized_output: bool,
     true_color: bool,
     extended_underlines: bool,
+    /// OSC11 / OSC111 - change the terminal's background color.
+    dynamic_background_color: bool,
     theme_mode: Option<theme::Mode>,
 }
 
@@ -76,6 +79,7 @@ pub struct TerminaBackend {
     capabilities: Capabilities,
     reset_cursor_command: String,
     is_synchronized_output_set: bool,
+    background_color: Option<RgbColor>,
 }
 
 impl TerminaBackend {
@@ -112,6 +116,7 @@ impl TerminaBackend {
             capabilities,
             reset_cursor_command,
             is_synchronized_output_set: false,
+            background_color: None,
         })
     }
 
@@ -132,6 +137,9 @@ impl TerminaBackend {
 
         let mut capabilities = Capabilities::default();
         let start = Instant::now();
+
+        // HACK: emitting OSC11 / OSC111 seems to break SGR and cause flickering in tmux.
+        capabilities.dynamic_background_color = std::env::var_os("TMUX").is_none();
 
         capabilities.kitty_keyboard = match config.kitty_keyboard_protocol {
             KittyKeyboardProtocolConfig::Disabled => KittyKeyboardSupport::None,
@@ -214,8 +222,7 @@ impl TerminaBackend {
 
         capabilities.extended_underlines |= config.force_enable_extended_underlines;
 
-        let mut reset_cursor_command =
-            Csi::Cursor(csi::Cursor::CursorStyle(CursorStyle::Default)).to_string();
+        let mut reset_cursor_command = String::new();
         if let Ok(t) = termini::TermInfo::from_env() {
             capabilities.extended_underlines |= t.extended_cap("Smulx").is_some()
                 || t.extended_cap("Su").is_some()
@@ -237,6 +244,8 @@ impl TerminaBackend {
         } else {
             log::debug!("terminfo could not be read, using default cursor reset escape sequence: {reset_cursor_command:?}");
         }
+        reset_cursor_command
+            .push_str(&Csi::Cursor(csi::Cursor::CursorStyle(CursorStyle::Default)).to_string());
 
         terminal.enter_cooked_mode()?;
 
@@ -365,6 +374,7 @@ impl TerminaBackend {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn end_sychronized_render(&mut self) -> io::Result<()> {
         if self.is_synchronized_output_set {
             write!(self.terminal, "{}", decreset!(SynchronizedOutput))?;
@@ -389,11 +399,18 @@ impl Backend for TerminaBackend {
             // things like mosh are buggy. See <https://github.com/helix-editor/helix/pull/1944>.
             Csi::Edit(csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseDisplay)),
         )?;
+        if let Some(color) = self.background_color {
+            write!(
+                self.terminal,
+                "{}",
+                Osc::ChangeDynamicColors(
+                    osc::DynamicColorNumber::TextBackgroundColor,
+                    vec![color.into()]
+                )
+            )?;
+        }
         self.enable_mouse_capture()?;
         self.enable_extensions()?;
-
-        // Ensure mode changes (alt-screen, mouse, etc.) take effect immediately.
-        self.terminal.flush()?;
 
         Ok(())
     }
@@ -406,8 +423,6 @@ impl Backend for TerminaBackend {
             } else {
                 self.disable_mouse_capture()?;
             }
-            // Apply mouse mode change immediately.
-            self.terminal.flush()?;
         }
         self.capabilities.extended_underlines |= self.config.force_enable_extended_underlines;
         Ok(())
@@ -424,6 +439,13 @@ impl Backend for TerminaBackend {
             decreset!(FocusTracking),
             decreset!(ClearAndEnableAlternateScreen),
         )?;
+        if self.background_color.is_some() {
+            write!(
+                self.terminal,
+                "{}",
+                Osc::ResetDynamicColor(osc::DynamicColorNumber::TextBackgroundColor)
+            )?;
+        }
         self.terminal.flush()?;
         self.terminal.enter_cooked_mode()?;
         Ok(())
@@ -433,8 +455,6 @@ impl Backend for TerminaBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.start_synchronized_render()?;
-
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
         let mut underline_color = Color::Reset;
@@ -512,8 +532,6 @@ impl Backend for TerminaBackend {
 
         write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
 
-        self.end_sychronized_render()?;
-
         Ok(())
     }
 
@@ -575,6 +593,27 @@ impl Backend for TerminaBackend {
     fn get_theme_mode(&self) -> Option<theme::Mode> {
         self.capabilities.theme_mode
     }
+
+    fn set_background_color(&mut self, color: Option<Color>) -> io::Result<()> {
+        if !self.capabilities.dynamic_background_color {
+            return Ok(());
+        }
+        self.background_color = match color {
+            Some(Color::Rgb(r, g, b)) => Some(RgbColor::new(r, g, b)),
+            _ => None,
+        };
+        write!(
+            self.terminal,
+            "{}",
+            match self.background_color {
+                Some(color) => Osc::ChangeDynamicColors(
+                    osc::DynamicColorNumber::TextBackgroundColor,
+                    vec![color.into()]
+                ),
+                _ => Osc::ResetDynamicColor(osc::DynamicColorNumber::TextBackgroundColor),
+            }
+        )
+    }
 }
 
 impl Drop for TerminaBackend {
@@ -592,6 +631,13 @@ impl Drop for TerminaBackend {
                 decreset!(FocusTracking),
                 decreset!(ClearAndEnableAlternateScreen),
             );
+            if self.background_color.is_some() {
+                let _ = write!(
+                    self.terminal,
+                    "{}",
+                    Osc::ResetDynamicColor(osc::DynamicColorNumber::TextBackgroundColor)
+                );
+            }
             // NOTE: Drop for Platform terminal resets the mode and flushes the buffer when not
             // panicking.
         }

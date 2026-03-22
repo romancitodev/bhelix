@@ -12,6 +12,7 @@ use helix_view::{
 
 use crate::ui::ProgressSpinners;
 
+use helix_core::{tree_sitter::Node as TsNode, RopeSlice};
 use helix_view::editor::StatusLineElement as StatusLineElementID;
 use std::sync::{LazyLock, Mutex};
 use tui::buffer::Buffer as Surface;
@@ -662,7 +663,17 @@ where
 {
     let function_name = get_current_function_name_cached(context);
     if let Some(name) = function_name {
-        write(context, format!(" {} ", name).into());
+        let icons = ICONS.load();
+        if let Some(icon) = icons.kind().get("function") {
+            let glyph = icon.glyph();
+            if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
+                write(context, Span::styled(format!(" {} {}", glyph, name), style));
+            } else {
+                write(context, format!(" {} {} ", glyph, name).into());
+            }
+        } else {
+            write(context, format!(" {} ", name).into());
+        }
     }
 }
 
@@ -713,6 +724,48 @@ fn get_current_function_name_cached(context: &RenderContext) -> Option<String> {
     name
 }
 
+/// Extract a function name from a C/C++ declarator chain.
+///
+/// In C/C++, the function name is not a direct child of `function_definition`
+/// but is nested inside a declarator chain:
+///   function_definition → function_declarator → (qualified_identifier →)* identifier
+fn extract_name_from_declarator(node: TsNode<'_>, text: RopeSlice<'_>) -> Option<String> {
+    let kind = node.kind();
+    match kind {
+        "identifier" | "field_identifier" => {
+            let start_char = text.byte_to_char(node.start_byte() as usize);
+            let end_char = text.byte_to_char(node.end_byte() as usize);
+            Some(text.slice(start_char..end_char).to_string())
+        }
+        "qualified_identifier" => {
+            // Iterate in reverse to get the rightmost (innermost) identifier,
+            // stripping any namespace/class prefix (e.g. "trace::is_valid" → "is_valid").
+            for i in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(i) {
+                    if child.kind() == "identifier" || child.kind() == "field_identifier" {
+                        let start_char = text.byte_to_char(child.start_byte() as usize);
+                        let end_char = text.byte_to_char(child.end_byte() as usize);
+                        return Some(text.slice(start_char..end_char).to_string());
+                    }
+                }
+            }
+            None
+        }
+        k if k.contains("declarator") => {
+            // Handles function_declarator, pointer_declarator, reference_declarator, etc.
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if let Some(name) = extract_name_from_declarator(child, text) {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn get_current_function_name(context: &RenderContext) -> Option<String> {
     let syntax = context.doc.syntax()?;
     let text = context.doc.text().slice(..);
@@ -745,6 +798,18 @@ fn get_current_function_name(context: &RenderContext) -> Option<String> {
                         let end_char = text.byte_to_char(end_byte);
                         let name = text.slice(start_char..end_char).to_string();
                         return Some(name);
+                    }
+                }
+            }
+
+            // C/C++: name is inside a declarator chain
+            // e.g. function_definition → function_declarator → qualified_identifier → identifier
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if child.kind().contains("declarator") {
+                        if let Some(name) = extract_name_from_declarator(child, text) {
+                            return Some(name);
+                        }
                     }
                 }
             }
