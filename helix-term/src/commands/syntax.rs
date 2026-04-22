@@ -40,6 +40,7 @@ enum TagKind {
     Class,
     Constant,
     Enum,
+    Field,
     Function,
     Interface,
     Macro,
@@ -55,6 +56,7 @@ impl TagKind {
             Self::Class => "class",
             Self::Constant => "constant",
             Self::Enum => "enum",
+            Self::Field => "field",
             Self::Function => "function",
             Self::Interface => "interface",
             Self::Macro => "macro",
@@ -70,6 +72,7 @@ impl TagKind {
             "class" => Some(TagKind::Class),
             "constant" => Some(TagKind::Constant),
             "enum" => Some(TagKind::Enum),
+            "field" => Some(TagKind::Field),
             "function" => Some(TagKind::Function),
             "interface" => Some(TagKind::Interface),
             "macro" => Some(TagKind::Macro),
@@ -188,7 +191,8 @@ pub fn syntax_symbol_picker(cx: &mut Context) {
     .with_preview(|_editor, tag| {
         Some((tag.doc.path_or_id()?, Some((tag.start_line, tag.end_line))))
     })
-    .truncate_start(false);
+    .truncate_start(false)
+    .with_title("Document Symbols");
 
     cx.push_layer(Box::new(overlaid(picker)));
 }
@@ -433,7 +437,8 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         ))
     })
     .with_history_register(Some(reg))
-    .truncate_start(false);
+    .truncate_start(false)
+    .with_title("Workspace Symbols");
     cx.push_layer(Box::new(overlaid(picker)));
 }
 

@@ -274,6 +274,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
     /// Cached gradient border for rendering when enabled in config
     gradient_border: Option<GradientBorder>,
+    /// Title to display at the top of the picker
+    title: Option<&'static str>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -397,6 +399,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
             gradient_border: None,
+            title: None,
         }
     }
 
@@ -439,6 +442,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn show_preview(mut self, show_preview: bool) -> Self {
         self.show_preview = show_preview;
+        self
+    }
+
+    /// Set a title to display at the top of the picker
+    pub fn with_title(mut self, title: &'static str) -> Self {
+        self.title = Some(title);
         self
     }
 
@@ -733,7 +742,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
             if let Some(ref mut gradient_border) = self.gradient_border {
                 let rounded = cx.editor.config().rounded_corners;
-                gradient_border.render(area, surface, &cx.editor.theme, rounded);
+                gradient_border.render_with_title(
+                    area,
+                    surface,
+                    &cx.editor.theme,
+                    self.title,
+                    rounded,
+                );
             }
 
             let t: u16 = cx.editor.config().gradient_borders.thickness as u16;
@@ -744,7 +759,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 height: area.height.saturating_sub(t * 2),
             }
         } else {
-            let block = Block::bordered();
+            let block = if let Some(title) = self.title {
+                Block::bordered().title(title)
+            } else {
+                Block::bordered()
+            };
             let inner_area = block.inner(area);
             block.render(area, surface);
             inner_area
@@ -1320,3 +1339,161 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
 pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + 'static>;
 pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===========================================
+    // Picker Title Tests
+    // ===========================================
+
+    #[test]
+    fn test_picker_title_default_none() {
+        // Create a simple picker and verify title is None by default
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["item1".to_string(), "item2".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        );
+
+        assert!(picker.title.is_none());
+    }
+
+    #[test]
+    fn test_picker_with_title() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["item1".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .with_title("Test Title");
+
+        assert_eq!(picker.title, Some("Test Title"));
+    }
+
+    #[test]
+    fn test_picker_title_chaining() {
+        // Test that with_title can be chained with other builder methods
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["item1".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .truncate_start(false)
+        .with_title("Chained Title")
+        .show_preview(false);
+
+        assert_eq!(picker.title, Some("Chained Title"));
+        assert!(!picker.truncate_start);
+        assert!(!picker.show_preview);
+    }
+
+    #[test]
+    fn test_picker_title_empty_string() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {}).with_title("");
+
+        // Empty string is still Some("")
+        assert_eq!(picker.title, Some(""));
+    }
+
+    #[test]
+    fn test_picker_title_with_special_characters() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {})
+                .with_title("Files 📁 & Folders");
+
+        assert_eq!(picker.title, Some("Files 📁 & Folders"));
+    }
+
+    #[test]
+    fn test_picker_title_various_picker_types() {
+        // Test with different item types to ensure generics work correctly
+
+        // String items
+        let columns_str = [Column::new("name", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker_str: Picker<String, ()> = Picker::new(
+            columns_str,
+            0,
+            vec!["a".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .with_title("String Picker");
+        assert_eq!(picker_str.title, Some("String Picker"));
+
+        // Integer items
+        let columns_int = [Column::new("num", |item: &i32, _: &()| {
+            item.to_string().into()
+        })];
+        let picker_int: Picker<i32, ()> =
+            Picker::new(columns_int, 0, vec![1, 2, 3], (), |_cx, _item, _action| {})
+                .with_title("Integer Picker");
+        assert_eq!(picker_int.title, Some("Integer Picker"));
+    }
+
+    // ===========================================
+    // Picker Constants Tests
+    // ===========================================
+
+    #[test]
+    fn test_picker_id_constant() {
+        assert_eq!(ID, "picker");
+    }
+
+    #[test]
+    fn test_min_area_constants() {
+        assert_eq!(MIN_AREA_WIDTH_FOR_PREVIEW, 72);
+        assert_eq!(MIN_AREA_HEIGHT_FOR_PREVIEW, 24);
+    }
+
+    #[test]
+    fn test_max_file_size_for_preview() {
+        // 10 MB
+        assert_eq!(MAX_FILE_SIZE_FOR_PREVIEW, 10 * 1024 * 1024);
+    }
+
+    // ===========================================
+    // Picker Movement Tests
+    // ===========================================
+
+    #[test]
+    fn test_picker_cursor_starts_at_zero() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        );
+
+        assert_eq!(picker.cursor, 0);
+    }
+}

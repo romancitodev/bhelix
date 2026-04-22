@@ -135,16 +135,19 @@ pub fn raw_regex_prompt(
                                 false
                             };
 
+                            let is_crlf = doc!(cx.editor).line_ending == helix_core::LineEnding::Crlf;
                             match rope::RegexBuilder::new()
                                 .syntax(
                                     rope::Config::new()
                                         .case_insensitive(case_insensitive)
-                                        .multi_line(true),
+                                        .multi_line(true)
+                                        .crlf(is_crlf),
                                 )
                                 .build(input)
                             {
                                 Ok(regex) => {
                                     let (view, doc) = current!(cx.editor);
+
                                     doc.set_selection(view.id, snapshot.clone());
 
                                     if event == PromptEvent::Validate {
@@ -379,7 +382,8 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
         }
     })
     .with_preview(|_editor, path| Some((path.as_path().into(), None)))
-    .show_preview(!config.file_picker.hide_preview);
+    .show_preview(!config.file_picker.hide_preview)
+    .with_title("Files");
     let injector = picker.injector();
     let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
 

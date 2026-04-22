@@ -1,4 +1,4 @@
-use futures_util::{stream::FuturesOrdered, FutureExt};
+use futures_util::{stream::FuturesUnordered, FutureExt};
 use helix_lsp::{
     block_on,
     lsp::{
@@ -357,7 +357,7 @@ pub fn symbol_picker(cx: &mut Context) {
 
     let mut seen_language_servers = HashSet::new();
 
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
         .filter(|ls| seen_language_servers.insert(ls.id()))
         .map(|language_server| {
@@ -465,7 +465,8 @@ pub fn symbol_picker(cx: &mut Context) {
                 },
             )
             .with_preview(move |_editor, item| location_to_file_location(&item.location))
-            .truncate_start(false);
+            .truncate_start(false)
+            .with_title("Document Symbols");
 
             compositor.push(Box::new(overlaid(picker)))
         };
@@ -491,7 +492,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
     let get_symbols = |pattern: &str, editor: &mut Editor, _data, injector: &Injector<_, _>| {
         let doc = doc!(editor);
         let mut seen_language_servers = HashSet::new();
-        let mut futures: FuturesOrdered<_> = doc
+        let mut futures: FuturesUnordered<_> = doc
             .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
             .filter(|ls| seen_language_servers.insert(ls.id()))
             .map(|language_server| {
@@ -607,7 +608,8 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
     )
     .with_preview(|_editor, item| location_to_file_location(&item.location))
     .with_dynamic_query(get_symbols, None)
-    .truncate_start(false);
+    .truncate_start(false)
+    .with_title("Workspace Symbols");
 
     cx.push_layer(Box::new(overlaid(picker)));
 }
@@ -616,7 +618,8 @@ pub fn diagnostics_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
     if let Some(uri) = doc.uri() {
         let diagnostics = cx.editor.diagnostics.get(&uri).cloned().unwrap_or_default();
-        let picker = diag_picker(cx, [(uri, diagnostics)], DiagnosticsFormat::HideSourcePath);
+        let picker = diag_picker(cx, [(uri, diagnostics)], DiagnosticsFormat::HideSourcePath)
+            .with_title("Diagnostics");
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -624,7 +627,8 @@ pub fn diagnostics_picker(cx: &mut Context) {
 pub fn workspace_diagnostics_picker(cx: &mut Context) {
     // TODO not yet filtered by LanguageServerFeature, need to do something similar as Document::shown_diagnostics here for all open documents
     let diagnostics = cx.editor.diagnostics.clone();
-    let picker = diag_picker(cx, diagnostics, DiagnosticsFormat::ShowSourcePath);
+    let picker = diag_picker(cx, diagnostics, DiagnosticsFormat::ShowSourcePath)
+        .with_title("Workspace Diagnostics");
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -715,7 +719,7 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
 
     let mut seen_language_servers = HashSet::new();
 
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::CodeAction)
         .filter(|ls| seen_language_servers.insert(ls.id()))
         // TODO this should probably already been filtered in something like "language_servers_with_feature"
@@ -880,7 +884,8 @@ fn code_action_inner_picker(
                     lsp_item.language_server_id,
                 );
             },
-        );
+        )
+        .with_title("Code Actions");
         compositor.push(Box::new(overlaid(picker)));
     };
     Ok(Callback::EditorCompositor(Box::new(call)))
@@ -957,7 +962,7 @@ impl Display for ApplyEditErrorKind {
 
 /// Precondition: `locations` should be non-empty.
 fn goto_impl(
-    _title: &'static str,
+    title: &'static str,
     editor: &mut Editor,
     compositor: &mut Compositor,
     locations: Vec<Location>,
@@ -986,7 +991,8 @@ fn goto_impl(
             let picker = Picker::new(columns, 0, locations, cwdir, |cx, location, action| {
                 jump_to_location(cx.editor, location, action)
             })
-            .with_preview(|_editor, location| location_to_file_location(location));
+            .with_preview(|_editor, location| location_to_file_location(location))
+            .with_title(title);
             compositor.push(Box::new(overlaid(picker)));
         }
     }
@@ -998,7 +1004,7 @@ where
     F: Future<Output = helix_lsp::Result<Option<lsp::GotoDefinitionResponse>>> + 'static + Send,
 {
     let (view, doc) = current_ref!(cx.editor);
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(feature)
         .map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
@@ -1094,7 +1100,7 @@ pub fn goto_reference(cx: &mut Context) {
     let config = cx.editor.config();
     let (view, doc) = current_ref!(cx.editor);
 
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::GotoReference)
         .map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
@@ -1161,7 +1167,7 @@ fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
     }
 
     let mut seen_language_servers = HashSet::new();
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::Hover)
         .filter(|ls| seen_language_servers.insert(ls.id()))
         .map(|language_server| {
