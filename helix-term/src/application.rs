@@ -13,7 +13,7 @@ use helix_view::{
     editor::{ConfigEvent, EditorEvent},
     events::EditorConfigDidChange,
     graphics::Rect,
-    theme,
+    persistence, theme,
     tree::Layout,
     Align, Editor,
 };
@@ -26,13 +26,14 @@ use crate::{
     config::Config,
     events::OnModeSwitch,
     handlers,
-    job::Jobs,
+    job::{Job, Jobs},
     keymap::Keymaps,
     ui::{self, overlay::overlaid},
 };
 
 use log::{debug, error, info, warn};
 use std::{
+    collections::HashMap,
     io::{stdin, IsTerminal},
     path::Path,
     sync::Arc,
@@ -100,24 +101,16 @@ fn setup_integration_logging() {
         .map(|lvl| lvl.parse().unwrap())
         .unwrap_or(log::LevelFilter::Info);
 
-    // Separate file config so we can include year, month and day in file logs
-    let _ = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} {} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(level)
-        .chain(std::io::stdout())
-        .apply();
+    crate::logging::init_stdout(level);
 }
 
 impl Application {
-    pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
+    pub fn new(
+        args: Args,
+        config: Config,
+        lang_loader: syntax::Loader,
+        workspace_trust: helix_loader::workspace_trust::WorkspaceTrust,
+    ) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();
 
@@ -142,6 +135,16 @@ impl Application {
         let mut compositor = Compositor::new(area);
         let config = Arc::new(ArcSwap::from_pointee(config));
         let handlers = handlers::setup(config.clone());
+        let persistence_config = config.load().editor.persistence.clone();
+        let old_file_locs = if persistence_config.old_files {
+            HashMap::from_iter(
+                persistence::read_file_history()
+                    .into_iter()
+                    .map(|entry| (entry.path.clone(), (entry.view_position, entry.selection))),
+            )
+        } else {
+            HashMap::new()
+        };
         let mut editor = Editor::new(
             area,
             Arc::new(theme_loader),
@@ -150,7 +153,30 @@ impl Application {
                 &config.editor
             })),
             handlers,
+            workspace_trust,
+            old_file_locs,
         );
+
+        // Load cross-session history into registers when enabled.
+        if persistence_config.commands {
+            editor
+                .registers
+                .write(':', persistence::read_command_history())
+                .unwrap();
+        }
+        if persistence_config.search {
+            editor
+                .registers
+                .write('/', persistence::read_search_history())
+                .unwrap();
+        }
+        if persistence_config.clipboard {
+            editor
+                .registers
+                .write('"', persistence::read_clipboard_file())
+                .unwrap();
+        }
+
         Self::load_configured_theme(&mut editor, &config.load(), &mut terminal, theme_mode);
 
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
@@ -160,6 +186,36 @@ impl Application {
         compositor.push(editor_view);
 
         let jobs = Jobs::new();
+        if persistence_config.old_files {
+            let file_trim = persistence_config.old_files_trim;
+            jobs.add(
+                Job::new(async move {
+                    persistence::trim_file_history(file_trim);
+                    Ok(())
+                })
+                .wait_before_exiting(),
+            );
+        }
+        if persistence_config.commands {
+            let commands_trim = persistence_config.commands_trim;
+            jobs.add(
+                Job::new(async move {
+                    persistence::trim_command_history(commands_trim);
+                    Ok(())
+                })
+                .wait_before_exiting(),
+            );
+        }
+        if persistence_config.search {
+            let search_trim = persistence_config.search_trim;
+            jobs.add(
+                Job::new(async move {
+                    persistence::trim_search_history(search_trim);
+                    Ok(())
+                })
+                .wait_before_exiting(),
+            );
+        }
 
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
@@ -172,7 +228,10 @@ impl Application {
             // If the first file is a directory, skip it and open a picker
             if let Some((first, _)) = files_it.next_if(|(p, _)| p.is_dir()) {
                 let picker = ui::file_picker(&editor, first);
-                compositor.push(Box::new(overlaid(picker)));
+                compositor.push(Box::new(overlaid(
+                    picker,
+                    editor.config().fullscreen_overlay,
+                )));
             }
 
             // If there are any more files specified, open them
@@ -218,15 +277,22 @@ impl Application {
                         // NOTE: this isn't necessarily true anymore. If
                         // `--vsplit` or `--hsplit` are used, the file which is
                         // opened last is focused on.
-                        let view_id = editor.tree.focus;
-                        let doc = doc_mut!(editor, &doc_id);
-                        let selection = pos
-                            .into_iter()
-                            .map(|coords| {
-                                Range::point(pos_at_coords(doc.text().slice(..), coords, true))
-                            })
-                            .collect();
-                        doc.set_selection(view_id, selection);
+                        //
+                        // Only apply CLI positions when explicitly provided
+                        // (`hx file:LINE[:COL]`, `+N`). When absent, any
+                        // position restored by [editor.persistence] old-files
+                        // inside open() must stand.
+                        if let Some(pos) = pos {
+                            let view_id = editor.tree.focus;
+                            let doc = doc_mut!(editor, &doc_id);
+                            let selection = pos
+                                .into_iter()
+                                .map(|coords| {
+                                    Range::point(pos_at_coords(doc.text().slice(..), coords, true))
+                                })
+                                .collect();
+                            doc.set_selection(view_id, selection);
+                        }
                     }
                 }
 
@@ -310,10 +376,7 @@ impl Application {
                     event_type: EventType::OnSelectionChange,
                     data: EventData::Buffer {
                         document_id: event.doc.id(),
-                        path: event
-                            .doc
-                            .path()
-                            .map(|p: &std::path::PathBuf| p.to_path_buf()),
+                        path: event.doc.path().map(|p: &std::path::Path| p.to_path_buf()),
                     },
                 });
             }
@@ -471,8 +534,10 @@ impl Application {
                     self.handle_terminal_events(event).await;
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
-                    self.render().await;
+                    if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback))) {
+                        self.jobs.add(job);
+                    }
+                    helix_event::request_redraw();
                 }
                 Some(msg) = self.jobs.status_messages.recv() => {
                     let severity = match msg.severity{
@@ -486,8 +551,10 @@ impl Application {
                     helix_event::request_redraw();
                 }
                 Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
-                    self.render().await;
+                    if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback) {
+                        self.jobs.add(job);
+                    }
+                    helix_event::request_redraw();
                 }
                 Some(request) = self.ui_receiver.recv() => {
                     self.handle_ui_request(request).await;
@@ -498,7 +565,11 @@ impl Application {
 
                     #[cfg(feature = "integration")]
                     {
-                        if _idle_handled {
+                        // Don't report idle while a save is still in flight, or an assertion on the post-save document state (e.g. its path,
+                        // set in `handle_document_write`) can run before the `DocumentSavedEvent` is processed. Slow file I/O on Windows
+                        // (atomic_save's rename/fsync dance over the still-open temp file) makes this race observable.
+                        // Errors produce an event too, so it cannot hang.
+                        if _idle_handled && self.editor.write_count == 0 {
                             return true;
                         }
                     }
@@ -563,10 +634,15 @@ impl Application {
             let default_config = Config::load_default()
                 .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
 
+            // Apply any change to editor.workspace_trust before reading local language config.
+            self.editor
+                .workspace_trust
+                .set_config((&default_config.editor.workspace_trust).into());
+
             // Update the syntax language loader before setting the theme. Setting the theme will
             // call `Loader::set_scopes` which must be done before the documents are re-parsed for
             // the sake of locals highlighting.
-            let lang_loader = helix_core::config::user_lang_loader(default_config.editor.insecure)?;
+            let lang_loader = helix_core::config::user_lang_loader(&self.editor.workspace_trust)?;
             self.editor.syn_loader.store(Arc::new(lang_loader));
             Self::load_configured_theme(
                 &mut self.editor,
@@ -896,7 +972,10 @@ impl Application {
                         );
                     })
                     .with_title("Plugin");
-                self.compositor.push(Box::new(overlaid(picker)));
+                self.compositor.push(Box::new(overlaid(
+                    picker,
+                    self.editor.config().fullscreen_overlay,
+                )));
             }
         }
     }
@@ -986,14 +1065,21 @@ impl Application {
             }) => false,
             #[cfg(not(windows))]
             termina::Event::Csi(csi::Csi::Mode(csi::Mode::ReportTheme(mode))) => {
-                self.theme_mode = Some(mode.into());
-                Self::load_configured_theme(
-                    &mut self.editor,
-                    &self.config.load(),
-                    &mut self.terminal,
-                    self.theme_mode,
-                );
-                true
+                let config = self.config.load();
+                let mode = mode.into();
+                let mode_changed = self.theme_mode.as_ref().is_none_or(|m| m != &mode);
+                if mode_changed && config.theme.as_ref().is_some_and(|t| t.is_adaptive()) {
+                    self.theme_mode = Some(mode);
+                    Self::load_configured_theme(
+                        &mut self.editor,
+                        &config,
+                        &mut self.terminal,
+                        self.theme_mode,
+                    );
+                    true
+                } else {
+                    false
+                }
             }
             #[cfg(windows)]
             TerminalEvent::Resize(width, height) => {
@@ -1176,6 +1262,10 @@ impl Application {
                                     self.lsp_progress.end_progress(server_id, &token);
                                     if !self.lsp_progress.is_progressing(server_id) {
                                         editor_view.spinners_mut().get_or_create(server_id).stop();
+                                        handlers::diagnostics::request_all_document_diagnostics_for_language_server(
+                                            &mut self.editor,
+                                            server_id,
+                                        );
                                     }
                                     self.editor.clear_status();
 
@@ -1220,6 +1310,10 @@ impl Application {
                                 self.lsp_progress.end_progress(server_id, &token);
                                 if !self.lsp_progress.is_progressing(server_id) {
                                     editor_view.spinners_mut().get_or_create(server_id).stop();
+                                    handlers::diagnostics::request_all_document_diagnostics_for_language_server(
+                                        &mut self.editor,
+                                        server_id,
+                                    );
                                 };
                             }
                         }
@@ -1228,7 +1322,9 @@ impl Application {
                         // do nothing
                     }
                     Notification::Exit => {
-                        self.editor.set_status("Language server exited");
+                        let status =
+                            format!("Language server exited: {}", language_server!().name());
+                        self.editor.set_status(status);
 
                         // LSPs may produce diagnostics for files that haven't been opened in helix,
                         // we need to clear those and remove the entries from the list if this leads to
@@ -1408,22 +1504,11 @@ impl Application {
                         Ok(json!(result))
                     }
                     Ok(MethodCall::WorkspaceDiagnosticRefresh) => {
-                        let language_server = language_server!().id();
-
-                        let documents: Vec<_> = self
-                            .editor
-                            .documents
-                            .values()
-                            .filter(|x| x.supports_language_server(language_server))
-                            .map(|x| x.id())
-                            .collect();
-
-                        for document in documents {
-                            handlers::diagnostics::request_document_diagnostics(
-                                &mut self.editor,
-                                document,
-                            );
-                        }
+                        let server_id = language_server!().id();
+                        handlers::diagnostics::request_all_document_diagnostics_for_language_server(
+                            &mut self.editor,
+                            server_id,
+                        );
 
                         Ok(serde_json::Value::Null)
                     }
@@ -1519,9 +1604,17 @@ impl Application {
         // If `Uri` gets another variant other than `Path` this may not be valid.
         let path = uri.as_path().expect("URIs are valid paths");
 
-        let action = match take_focus {
-            Some(true) => helix_view::editor::Action::Replace,
-            _ => helix_view::editor::Action::VerticalSplit,
+        // Determine the focus strategy based on the current UI state and LSP request:
+        // 1. If there is no pop-up overlay, jump directly (Replace).
+        // 2. If there is a pop-up overlay, unless the LSP forces take_focus, only load in the background (Load) to prevent interruption of input.
+        // Note: We assume layer_count() == 1 means only the EditorView is present (no popups/overlays).
+        let action = if self.compositor.layer_count() == 1 {
+            helix_view::editor::Action::Replace
+        } else {
+            match take_focus {
+                Some(true) => helix_view::editor::Action::Replace,
+                _ => helix_view::editor::Action::Load,
+            }
         };
 
         let doc_id = match self.editor.open(path, action) {
@@ -1640,12 +1733,7 @@ impl Application {
             errs.push(err);
         }
 
-        if self.editor.close_language_servers(None).await.is_err() {
-            log::error!("Timed out waiting for language servers to shutdown");
-            errs.push(anyhow::format_err!(
-                "Timed out waiting for language servers to shutdown"
-            ));
-        }
+        self.editor.close_language_servers(None).await;
 
         errs
     }

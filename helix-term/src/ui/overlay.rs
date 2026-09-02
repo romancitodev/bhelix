@@ -7,6 +7,8 @@ use tui::buffer::Buffer;
 
 use crate::compositor::{Component, Context, Event, EventResult};
 
+pub const FULL_OVERLAID_MAX_WIDTH: u16 = 200;
+
 /// Contains a component placed in the center of the parent component
 pub struct Overlay<T> {
     /// Child component
@@ -15,11 +17,19 @@ pub struct Overlay<T> {
     pub calc_child_size: Box<dyn Fn(Rect) -> Rect>,
 }
 
-/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom
-pub fn overlaid<T>(content: T) -> Overlay<T> {
+/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom.
+/// When `fullscreen` is true, uses full screen width on terminals narrower than `FULL_OVERLAID_MAX_WIDTH`.
+pub fn overlaid<T>(content: T, fullscreen: bool) -> Overlay<T> {
     Overlay {
         content,
-        calc_child_size: Box::new(|rect: Rect| clip_rect_relative(rect.clip_bottom(2), 90, 90)),
+        calc_child_size: Box::new(move |rect: Rect| {
+            let percentage = if fullscreen && rect.width < FULL_OVERLAID_MAX_WIDTH {
+                100
+            } else {
+                90
+            };
+            clip_rect_relative(rect.clip_bottom(2), percentage, percentage)
+        }),
     }
 }
 

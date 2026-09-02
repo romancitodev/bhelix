@@ -2,8 +2,8 @@ use futures_util::{stream::FuturesUnordered, FutureExt};
 use helix_lsp::{
     block_on,
     lsp::{
-        self, CodeAction, CodeActionOrCommand, CodeActionTriggerKind, DiagnosticSeverity,
-        NumberOrString,
+        self, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionTriggerKind,
+        DiagnosticSeverity, NumberOrString,
     },
     util::{diagnostic_to_lsp_diagnostic, lsp_range_to_range, range_to_lsp_range},
     Client, LanguageServerId, OffsetEncoding,
@@ -21,22 +21,27 @@ use helix_core::{
 };
 use helix_stdx::path;
 use helix_view::{
+    action::Action as CodeActionItem,
     document::{DocumentInlayHints, DocumentInlayHintsId},
     editor::Action,
     handlers::lsp::SignatureHelpInvoked,
     icons::ICONS,
     theme::Style,
-    Document, View,
+    Document, DocumentId, View,
 };
 
 use crate::{
     compositor::{self, Component, Compositor},
-    job::Callback,
+    job::{Callback, Job},
     ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
 };
 
 use std::{
-    cmp::Ordering, collections::HashSet, fmt::Display, future::Future, path::Path, sync::Arc,
+    collections::{HashSet, VecDeque},
+    fmt::Display,
+    future::Future,
+    path::Path,
+    sync::Arc,
 };
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
@@ -164,7 +169,7 @@ fn jump_to_position(
     }
 }
 
-fn display_symbol_kind(kind: lsp::SymbolKind) -> &'static str {
+pub(crate) fn display_symbol_kind(kind: lsp::SymbolKind) -> &'static str {
     match kind {
         lsp::SymbolKind::FILE => "file",
         lsp::SymbolKind::MODULE => "module",
@@ -420,7 +425,7 @@ pub fn symbol_picker(cx: &mut Context) {
                 Err(err) => log::error!("Error requesting document symbols: {err}"),
             }
         }
-        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
+        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
             let columns = [
                 ui::PickerColumn::new("kind", |item: &SymbolInformationItem, _| {
                     let icons = ICONS.load();
@@ -468,7 +473,10 @@ pub fn symbol_picker(cx: &mut Context) {
             .truncate_start(false)
             .with_title("Document Symbols");
 
-            compositor.push(Box::new(overlaid(picker)))
+            compositor.push(Box::new(overlaid(
+                picker,
+                editor.config().fullscreen_overlay,
+            )))
         };
 
         Ok(Callback::EditorCompositor(Box::new(call)))
@@ -611,7 +619,10 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
     .truncate_start(false)
     .with_title("Workspace Symbols");
 
-    cx.push_layer(Box::new(overlaid(picker)));
+    cx.push_layer(Box::new(overlaid(
+        picker,
+        cx.editor.config().fullscreen_overlay,
+    )));
 }
 
 pub fn diagnostics_picker(cx: &mut Context) {
@@ -620,7 +631,10 @@ pub fn diagnostics_picker(cx: &mut Context) {
         let diagnostics = cx.editor.diagnostics.get(&uri).cloned().unwrap_or_default();
         let picker = diag_picker(cx, [(uri, diagnostics)], DiagnosticsFormat::HideSourcePath)
             .with_title("Diagnostics");
-        cx.push_layer(Box::new(overlaid(picker)));
+        cx.push_layer(Box::new(overlaid(
+            picker,
+            cx.editor.config().fullscreen_overlay,
+        )));
     }
 }
 
@@ -629,79 +643,17 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
     let diagnostics = cx.editor.diagnostics.clone();
     let picker = diag_picker(cx, diagnostics, DiagnosticsFormat::ShowSourcePath)
         .with_title("Workspace Diagnostics");
-    cx.push_layer(Box::new(overlaid(picker)));
+    cx.push_layer(Box::new(overlaid(
+        picker,
+        cx.editor.config().fullscreen_overlay,
+    )));
 }
 
-struct CodeActionOrCommandItem {
-    lsp_item: lsp::CodeActionOrCommand,
-    language_server_id: LanguageServerId,
-}
-
-impl ui::menu::Item for CodeActionOrCommandItem {
+impl ui::menu::Item for CodeActionItem {
     type Data = ();
     fn format(&self, _data: &Self::Data) -> Row<'_> {
-        match &self.lsp_item {
-            lsp::CodeActionOrCommand::CodeAction(action) => action.title.as_str().into(),
-            lsp::CodeActionOrCommand::Command(command) => command.title.as_str().into(),
-        }
+        self.title().into()
     }
-}
-
-/// Determines the category of the `CodeAction` using the `CodeAction::kind` field.
-/// Returns a number that represent these categories.
-/// Categories with a lower number should be displayed first.
-///
-///
-/// While the `kind` field is defined as open ended in the LSP spec (any value may be used)
-/// in practice a closed set of common values (mostly suggested in the LSP spec) are used.
-/// VSCode displays each of these categories separately (separated by a heading in the codeactions picker)
-/// to make them easier to navigate. Helix does not display these  headings to the user.
-/// However it does sort code actions by their categories to achieve the same order as the VScode picker,
-/// just without the headings.
-///
-/// The order used here is modeled after the [vscode sourcecode](https://github.com/microsoft/vscode/blob/eaec601dd69aeb4abb63b9601a6f44308c8d8c6e/src/vs/editor/contrib/codeAction/browser/codeActionWidget.ts>)
-fn action_category(action: &CodeActionOrCommand) -> u32 {
-    if let CodeActionOrCommand::CodeAction(CodeAction {
-        kind: Some(kind), ..
-    }) = action
-    {
-        let mut components = kind.as_str().split('.');
-        match components.next() {
-            Some("quickfix") => 0,
-            Some("refactor") => match components.next() {
-                Some("extract") => 1,
-                Some("inline") => 2,
-                Some("rewrite") => 3,
-                Some("move") => 4,
-                Some("surround") => 5,
-                _ => 7,
-            },
-            Some("source") => 6,
-            _ => 7,
-        }
-    } else {
-        7
-    }
-}
-
-fn action_preferred(action: &CodeActionOrCommand) -> bool {
-    matches!(
-        action,
-        CodeActionOrCommand::CodeAction(CodeAction {
-            is_preferred: Some(true),
-            ..
-        })
-    )
-}
-
-fn action_fixes_diagnostics(action: &CodeActionOrCommand) -> bool {
-    matches!(
-        action,
-        CodeActionOrCommand::CodeAction(CodeAction {
-            diagnostics: Some(diagnostics),
-            ..
-        }) if !diagnostics.is_empty()
-    )
 }
 
 pub fn code_action(cx: &mut Context) {
@@ -717,92 +669,29 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
 
     let selection_range = doc.selection(view.id).primary();
 
-    let mut seen_language_servers = HashSet::new();
+    let mut futures: FuturesUnordered<_> =
+        code_actions_for_range(doc, selection_range, None, CodeActionTriggerKind::INVOKED)
+            .into_iter()
+            .map(|(request, ls_id)| async move {
+                let Some(mut actions) = request.await? else {
+                    return anyhow::Ok(Vec::new());
+                };
 
-    let mut futures: FuturesUnordered<_> = doc
-        .language_servers_with_feature(LanguageServerFeature::CodeAction)
-        .filter(|ls| seen_language_servers.insert(ls.id()))
-        // TODO this should probably already been filtered in something like "language_servers_with_feature"
-        .filter_map(|language_server| {
-            let offset_encoding = language_server.offset_encoding();
-            let language_server_id = language_server.id();
-            let range = range_to_lsp_range(doc.text(), selection_range, offset_encoding);
-            // Filter and convert overlapping diagnostics
-            let code_action_context = lsp::CodeActionContext {
-                diagnostics: doc
-                    .diagnostics()
-                    .iter()
-                    .filter(|&diag| {
-                        selection_range
-                            .overlaps(&helix_core::Range::new(diag.range.start, diag.range.end))
-                    })
-                    .map(|diag| diagnostic_to_lsp_diagnostic(doc.text(), diag, offset_encoding))
-                    .collect(),
-                only: None,
-                trigger_kind: Some(CodeActionTriggerKind::INVOKED),
-            };
-            let code_action_request =
-                language_server.code_actions(doc.identifier(), range, code_action_context)?;
-            Some((code_action_request, language_server_id))
-        })
-        .map(|(request, ls_id)| async move {
-            let Some(mut actions) = request.await? else {
-                return anyhow::Ok(Vec::new());
-            };
+                // remove disabled code actions
+                actions.retain(|action| {
+                    matches!(
+                        action,
+                        CodeActionOrCommand::Command(_)
+                            | CodeActionOrCommand::CodeAction(CodeAction { disabled: None, .. })
+                    )
+                });
 
-            // remove disabled code actions
-            actions.retain(|action| {
-                matches!(
-                    action,
-                    CodeActionOrCommand::Command(_)
-                        | CodeActionOrCommand::CodeAction(CodeAction { disabled: None, .. })
-                )
-            });
-
-            // Sort codeactions into a useful order. This behaviour is only partially described in the LSP spec.
-            // Many details are modeled after vscode because language servers are usually tested against it.
-            // VScode sorts the codeaction two times:
-            //
-            // First the codeactions that fix some diagnostics are moved to the front.
-            // If both codeactions fix some diagnostics (or both fix none) the codeaction
-            // that is marked with `is_preferred` is shown first. The codeactions are then shown in separate
-            // submenus that only contain a certain category (see `action_category`) of actions.
-            //
-            // Below this done in in a single sorting step
-            actions.sort_by(|action1, action2| {
-                // sort actions by category
-                let order = action_category(action1).cmp(&action_category(action2));
-                if order != Ordering::Equal {
-                    return order;
-                }
-                // within the categories sort by relevancy.
-                // Modeled after the `codeActionsComparator` function in vscode:
-                // https://github.com/microsoft/vscode/blob/eaec601dd69aeb4abb63b9601a6f44308c8d8c6e/src/vs/editor/contrib/codeAction/browser/codeAction.ts
-
-                // if one code action fixes a diagnostic but the other one doesn't show it first
-                let order = action_fixes_diagnostics(action1)
-                    .cmp(&action_fixes_diagnostics(action2))
-                    .reverse();
-                if order != Ordering::Equal {
-                    return order;
-                }
-
-                // if one of the codeactions is marked as preferred show it first
-                // otherwise keep the original LSP sorting
-                action_preferred(action1)
-                    .cmp(&action_preferred(action2))
-                    .reverse()
-            });
-
-            Ok(actions
-                .into_iter()
-                .map(|lsp_item| CodeActionOrCommandItem {
-                    lsp_item,
-                    language_server_id: ls_id,
-                })
-                .collect())
-        })
-        .collect();
+                Ok(actions
+                    .into_iter()
+                    .map(|lsp_item| CodeActionItem::lsp(ls_id, lsp_item))
+                    .collect())
+            })
+            .collect();
 
     if futures.is_empty() {
         cx.editor
@@ -815,7 +704,7 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
 
         while let Some(output) = futures.next().await {
             match output {
-                Ok(mut lsp_items) => actions.append(&mut lsp_items),
+                Ok(mut items) => actions.append(&mut items),
                 Err(err) => log::error!("while gathering code actions: {err}"),
             }
         }
@@ -828,9 +717,7 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
     });
 }
 
-fn code_action_inner_menu(
-    actions: Vec<CodeActionOrCommandItem>,
-) -> Result<Callback, anyhow::Error> {
+fn code_action_inner_menu(actions: Vec<CodeActionItem>) -> Result<Callback, anyhow::Error> {
     let call = move |editor: &mut Editor, compositor: &mut Compositor| {
         if actions.is_empty() {
             editor.set_error("No code actions available");
@@ -841,12 +728,11 @@ fn code_action_inner_menu(
                 return;
             }
 
-            // always present here
             let action = action.unwrap();
 
-            code_action_handle_lsp_item(editor, &action.lsp_item, action.language_server_id);
+            action.execute(editor);
         });
-        picker.move_down(); // pre-select the first item
+        picker.move_down();
 
         let popup = Popup::new("code-action", picker).with_scrollbar(false);
 
@@ -856,9 +742,7 @@ fn code_action_inner_menu(
     Ok(Callback::EditorCompositor(Box::new(call)))
 }
 
-fn code_action_inner_picker(
-    actions: Vec<CodeActionOrCommandItem>,
-) -> Result<Callback, anyhow::Error> {
+fn code_action_inner_picker(actions: Vec<CodeActionItem>) -> Result<Callback, anyhow::Error> {
     let call = move |editor: &mut Editor, compositor: &mut Compositor| {
         if actions.is_empty() {
             editor.set_error("No code actions available");
@@ -866,71 +750,240 @@ fn code_action_inner_picker(
         }
         let columns = [ui::PickerColumn::new(
             "action",
-            |item: &CodeActionOrCommandItem, _| match &item.lsp_item {
-                lsp::CodeActionOrCommand::CodeAction(action) => action.title.as_str().into(),
-                lsp::CodeActionOrCommand::Command(command) => command.title.as_str().into(),
-            },
+            |item: &CodeActionItem, _| item.title().into(),
         )];
 
         let picker = ui::Picker::new(
             columns,
-            0, // action column
+            0,
             actions,
             (),
-            move |cx: &mut crate::compositor::Context, lsp_item, _action| {
-                code_action_handle_lsp_item(
-                    cx.editor,
-                    &lsp_item.lsp_item,
-                    lsp_item.language_server_id,
-                );
+            move |cx: &mut crate::compositor::Context, action, _| {
+                action.execute(cx.editor);
             },
         )
         .with_title("Code Actions");
-        compositor.push(Box::new(overlaid(picker)));
+        compositor.push(Box::new(overlaid(
+            picker,
+            editor.config().fullscreen_overlay,
+        )));
     };
     Ok(Callback::EditorCompositor(Box::new(call)))
 }
 
-fn code_action_handle_lsp_item(
-    editor: &mut Editor,
-    lsp_item: &CodeActionOrCommand,
-    language_server_id: LanguageServerId,
-) {
-    let Some(language_server) = editor.language_server_by_id(language_server_id) else {
-        editor.set_error("Language Server disappeared");
-        return;
-    };
-    let offset_encoding = language_server.offset_encoding();
+// Extracting this to a type alias would require boxing this future
+#[allow(clippy::type_complexity)]
+pub(crate) fn code_actions_for_range(
+    doc: &Document,
+    range: helix_core::Range,
+    only: Option<Vec<CodeActionKind>>,
+    trigger_kind: CodeActionTriggerKind,
+) -> Vec<(
+    impl Future<Output = Result<Option<Vec<CodeActionOrCommand>>, helix_lsp::Error>>,
+    LanguageServerId,
+)> {
+    let mut seen_language_servers = HashSet::new();
 
-    match lsp_item {
-        lsp::CodeActionOrCommand::Command(command) => {
-            log::debug!("code action command: {:?}", command);
-            editor.execute_lsp_command(command.clone(), language_server_id);
+    doc.language_servers_with_feature(LanguageServerFeature::CodeAction)
+        .filter(|ls| seen_language_servers.insert(ls.id()))
+        // TODO this should probably already been filtered in something like "language_servers_with_feature"
+        .filter_map(|language_server| {
+            let offset_encoding = language_server.offset_encoding();
+            let language_server_id = language_server.id();
+            let lsp_range = range_to_lsp_range(doc.text(), range, offset_encoding);
+            // Filter and convert overlapping diagnostics
+            let code_action_context = lsp::CodeActionContext {
+                diagnostics: doc
+                    .diagnostics()
+                    .iter()
+                    .filter(|&diag| {
+                        range.overlaps(&helix_core::Range::new(diag.range.start, diag.range.end))
+                    })
+                    .map(|diag| diagnostic_to_lsp_diagnostic(doc.text(), diag, offset_encoding))
+                    .collect(),
+                only: only.clone(),
+                trigger_kind: Some(trigger_kind),
+            };
+            let code_action_request =
+                language_server.code_actions(doc.identifier(), lsp_range, code_action_context)?;
+            Some((code_action_request, language_server_id))
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Build the job chain that runs a document's configured `code-actions-on-save`
+/// kinds, in order, each against the latest document state, before running
+/// `tail` (the auto-format / save job). Returns `tail` unchanged when nothing is
+/// configured.
+pub fn code_actions_on_save(
+    cx: &compositor::Context,
+    doc_id: DocumentId,
+    tail: Option<Job>,
+) -> Option<Job> {
+    let kinds = doc!(cx.editor, &doc_id)
+        .language_config()
+        .and_then(|config| config.code_actions_on_save.clone());
+    let Some(kinds) = kinds else {
+        return tail;
+    };
+    let kinds: VecDeque<CodeActionKind> = kinds.into_iter().map(CodeActionKind::from).collect();
+    code_action_on_save_step(doc_id, kinds, tail)
+}
+
+/// One link of the on-save chain: request the next kind's actions on the current
+/// document, apply them, then recurse for the rest. Each link is built lazily (as
+/// a `Followup`) so it reads the document after the previous link's edits, and
+/// runs the configured kinds strictly in order.
+fn code_action_on_save_step(
+    doc_id: DocumentId,
+    mut kinds: VecDeque<CodeActionKind>,
+    tail: Option<Job>,
+) -> Option<Job> {
+    let Some(kind) = kinds.pop_front() else {
+        // All kinds applied. Fall through to auto-format / save.
+        return tail;
+    };
+
+    let build_request = move |editor: &mut Editor| -> Option<Job> {
+        // The document could have been closed mid-chain
+        if !editor.documents.contains_key(&doc_id) {
+            return None;
         }
-        lsp::CodeActionOrCommand::CodeAction(code_action) => {
-            log::debug!("code action: {:?}", code_action);
-            // we support lsp "codeAction/resolve" for `edit` and `command` fields
-            let mut resolved_code_action = None;
-            if code_action.edit.is_none() || code_action.command.is_none() {
-                if let Some(future) = language_server.resolve_code_action(code_action) {
-                    if let Ok(response) = helix_lsp::block_on(future) {
-                        resolved_code_action = Some(response);
+        let doc = doc!(editor, &doc_id);
+        let version = doc.version();
+        let full_range = helix_core::Range::new(0, doc.text().len_chars());
+        let Some((request, ls_id)) = code_actions_for_range(
+            doc,
+            full_range,
+            Some(vec![kind.clone()]),
+            CodeActionTriggerKind::INVOKED,
+        )
+        .into_iter()
+        .next() else {
+            // No server offers this kind for the document: skip to the next.
+            return code_action_on_save_step(doc_id, kinds, tail);
+        };
+
+        let future = async move {
+            let actions = request.await?;
+            let resolve = move |editor: &mut Editor| -> Option<Job> {
+                resolve_and_apply_code_actions_of_kind(
+                    editor, doc_id, version, ls_id, kind, kinds, tail, actions,
+                )
+            };
+            Ok(Callback::Followup(Box::new(resolve)))
+        };
+        Some(Job::with_callback(future).wait_before_exiting())
+    };
+
+    Some(
+        Job::with_callback(async move { Ok(Callback::Followup(Box::new(build_request))) })
+            .wait_before_exiting(),
+    )
+}
+
+/// An action matches a requested kind when its kind equals the request or is a
+/// sub-kind (`source.fixAll.eslint` matches `source.fixAll`, per the LSP kind
+/// hierarchy). Actions without a kind are skipped, so a server that ignores the
+/// `only` filter can't slip an unrelated action into a save.
+fn code_action_kind_matches(action: &CodeAction, requested: &CodeActionKind) -> bool {
+    action.kind.as_ref().is_some_and(|kind| {
+        let (kind, requested) = (kind.as_str(), requested.as_str());
+        kind == requested
+            || (kind.starts_with(requested) && kind[requested.len()..].starts_with('.'))
+    })
+}
+
+/// One matching action, in server order: an edit ready to apply, or a  future
+/// resolving the action's edit off the event loop.
+///
+/// Keeping one ordered list preserves apply order, which matters when a kind yields
+/// several edits.
+type ResolveFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<lsp::CodeAction, helix_lsp::Error>> + Send>>;
+enum ResolveStep {
+    Ready(lsp::WorkspaceEdit),
+    Resolve(ResolveFuture),
+}
+
+/// Resolve (off the event loop) and apply the actions matching `kind`, then
+/// continue the on-save chain. The resolve is awaited in the returned job.
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_apply_code_actions_of_kind(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    version: i32,
+    ls_id: LanguageServerId,
+    kind: CodeActionKind,
+    kinds: VecDeque<CodeActionKind>,
+    tail: Option<Job>,
+    actions: Option<Vec<CodeActionOrCommand>>,
+) -> Option<Job> {
+    // Build the matching actions, in order, while holding the language-server
+    // borrow, resolving only those the server left incomplete.
+    let prepared = (|| -> Option<(OffsetEncoding, Vec<ResolveStep>)> {
+        let actions = actions?;
+        if editor.documents.get(&doc_id)?.version() != version {
+            log::debug!("code-actions-on-save: document changed, skipping {kind:?}");
+            return None;
+        }
+        let ls = editor.language_server_by_id(ls_id)?;
+        let steps = actions
+            .iter()
+            .filter_map(|action| match action {
+                CodeActionOrCommand::CodeAction(ca) if ca.disabled.is_none() => Some(ca),
+                _ => None,
+            })
+            .filter(|ca| code_action_kind_matches(ca, &kind))
+            .filter_map(|ca| {
+                // Resolve only when the server left out the edit or command.
+                if ca.edit.is_none() || ca.command.is_none() {
+                    if let Some(future) = ls.resolve_code_action(ca) {
+                        return Some(ResolveStep::Resolve(Box::pin(future)));
                     }
                 }
-            }
-            let resolved_code_action = resolved_code_action.as_ref().unwrap_or(code_action);
+                ca.edit.clone().map(ResolveStep::Ready)
+            })
+            .collect();
+        Some((ls.offset_encoding(), steps))
+    })();
+    let Some((offset_encoding, steps)) = prepared else {
+        return code_action_on_save_step(doc_id, kinds, tail);
+    };
 
-            if let Some(ref workspace_edit) = resolved_code_action.edit {
-                let _ = editor.apply_workspace_edit(offset_encoding, workspace_edit);
-            }
-
-            // if code action provides both edit and command first the edit
-            // should be applied and then the command
-            if let Some(command) = &code_action.command {
-                editor.execute_lsp_command(command.clone(), language_server_id);
+    let future = async move {
+        let mut edits = Vec::new();
+        for step in steps {
+            match step {
+                ResolveStep::Ready(edit) => edits.push(edit),
+                ResolveStep::Resolve(future) => match future.await {
+                    Ok(resolved) => edits.extend(resolved.edit),
+                    Err(err) => log::error!("code-actions-on-save: resolve failed: {err:?}"),
+                },
             }
         }
-    }
+        let apply = move |editor: &mut Editor| -> Option<Job> {
+            // A plain :w runs this in the live event loop so the document can
+            // change while resolving: re-check the version and skip rather than
+            // applying a stale edit.
+            if editor
+                .documents
+                .get(&doc_id)
+                .is_some_and(|doc| doc.version() == version)
+            {
+                for edit in &edits {
+                    if let Err(err) = editor.apply_workspace_edit(offset_encoding, edit) {
+                        log::error!("code-actions-on-save: failed to apply edit: {err:?}");
+                    }
+                }
+            } else {
+                log::debug!("code-actions-on-save: document changed, skipping {kind:?}");
+            }
+            code_action_on_save_step(doc_id, kinds, tail)
+        };
+        Ok(Callback::Followup(Box::new(apply)))
+    };
+    Some(Job::with_callback(future).wait_before_exiting())
 }
 
 #[derive(Debug)]
@@ -993,7 +1046,10 @@ fn goto_impl(
             })
             .with_preview(|_editor, location| location_to_file_location(location))
             .with_title(title);
-            compositor.push(Box::new(overlaid(picker)));
+            compositor.push(Box::new(overlaid(
+                picker,
+                editor.config().fullscreen_overlay,
+            )));
         }
     }
 }
@@ -1499,7 +1555,7 @@ fn compute_inlay_hints_for_view(
     // will not show half the view with hints and half without while still being faster
     // than computing all the hints for the full file (which could be dozens of time
     // longer than the view is).
-    let view_height = view.inner_height();
+    let view_height = view.inner_height(doc);
     let first_visible_line =
         doc_text.char_to_line(doc.view_offset(view_id).anchor.min(doc_text.len_chars()));
     let first_line = first_visible_line.saturating_sub(view_height);

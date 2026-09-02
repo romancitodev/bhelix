@@ -128,7 +128,10 @@ fn refresh_file_explorer(cursor: u32, cx: &mut Context, root: PathBuf) {
             // replace the old file explorer with the new one
             compositor.pop();
             if let Ok(picker) = file_explorer(Some(cursor), root, editor) {
-                compositor.push(Box::new(overlay::overlaid(picker)));
+                compositor.push(Box::new(overlay::overlaid(
+                    picker,
+                    editor.config().fullscreen_overlay,
+                )));
             }
         }));
         Ok(call)
@@ -392,7 +395,10 @@ pub fn file_explorer(
                     let call: Callback =
                         Callback::EditorCompositor(Box::new(move |editor, compositor| {
                             if let Ok(picker) = file_explorer(None, new_root, editor) {
-                                compositor.push(Box::new(overlay::overlaid(picker)));
+                                compositor.push(Box::new(overlay::overlaid(
+                                    picker,
+                                    editor.config().fullscreen_overlay,
+                                )));
                             }
                         }));
                     Ok(call)
@@ -461,7 +467,11 @@ mod tests {
 
     #[test]
     fn test_pathbuf_is_absolute() {
-        let abs_path = PathBuf::from("/home/user/file.txt");
+        let abs_path = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\user\file.txt")
+        } else {
+            PathBuf::from("/home/user/file.txt")
+        };
         let rel_path = PathBuf::from("./file.txt");
 
         assert!(abs_path.is_absolute());

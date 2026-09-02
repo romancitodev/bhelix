@@ -53,9 +53,15 @@
 | `extend_prev_char` | Extend to previous occurrence of char | select: `` F `` |
 | `repeat_last_motion` | Repeat last motion | normal: `` <A-.> ``, select: `` <A-.> `` |
 | `replace` | Replace with new char | normal: `` r ``, select: `` r `` |
-| `switch_case` | Switch (toggle) case | normal: `` ~ ``, select: `` ~ `` |
-| `switch_to_uppercase` | Switch to uppercase | normal: `` <A-`> ``, select: `` <A-`> `` |
-| `switch_to_lowercase` | Switch to lowercase | normal: `` ` ``, select: `` ` `` |
+| `switch_to_alternate_case` | Switch to aLTERNATE cASE | normal: `` ~ ``, `` `a ``, select: `` ~ ``, `` `a `` |
+| `switch_to_uppercase` | Switch to UPPERCASE | normal: `` `u ``, select: `` `u `` |
+| `switch_to_lowercase` | Switch to lowercase | normal: `` `l ``, select: `` `l `` |
+| `switch_to_pascal_case` | Switch to PascalCase | normal: `` `p ``, select: `` `p `` |
+| `switch_to_camel_case` | Switch to camelCase | normal: `` `c ``, select: `` `c `` |
+| `switch_to_title_case` | Switch to Title Case | normal: `` `t ``, select: `` `t `` |
+| `switch_to_sentence_case` | Switch to Sentence case | normal: `` `S ``, select: `` `S `` |
+| `switch_to_snake_case` | Switch to snake_case | normal: `` `s ``, select: `` `s `` |
+| `switch_to_kebab_case` | Switch to kebab-case | normal: `` `k ``, select: `` `k `` |
 | `page_up` | Move page up | normal: `` <C-b> ``, `` Z<C-b> ``, `` z<C-b> ``, `` <pageup> ``, `` Z<pageup> ``, `` z<pageup> ``, select: `` <C-b> ``, `` Z<C-b> ``, `` z<C-b> ``, `` <pageup> ``, `` Z<pageup> ``, `` z<pageup> ``, insert: `` <pageup> `` |
 | `page_down` | Move page down | normal: `` <C-f> ``, `` Z<C-f> ``, `` z<C-f> ``, `` <pagedown> ``, `` Z<pagedown> ``, `` z<pagedown> ``, select: `` <C-f> ``, `` Z<C-f> ``, `` z<C-f> ``, `` <pagedown> ``, `` Z<pagedown> ``, `` z<pagedown> ``, insert: `` <pagedown> `` |
 | `half_page_up` | Move half page up |  |
@@ -106,6 +112,7 @@
 | `file_explorer_in_current_buffer_directory` | Open file explorer at current buffer's directory | normal: `` <space>. ``, select: `` <space>. `` |
 | `file_explorer_in_current_directory` | Open file explorer at current working directory |  |
 | `code_action` | Perform code action | normal: `` <space>a ``, select: `` <space>a `` |
+| `code_action_picker` | Perform code action in a picker |  |
 | `buffer_picker` | Open buffer picker | normal: `` <space>b ``, select: `` <space>b `` |
 | `jumplist_picker` | Open jumplist picker | normal: `` <space>j ``, select: `` <space>j `` |
 | `symbol_picker` | Open symbol picker |  |
@@ -134,9 +141,9 @@
 | `move_lines_down` | Move current line selection down | normal: `` <C-j> ``, select: `` <C-j> `` |
 | `goto_type_definition` | Goto type definition | normal: `` gy ``, select: `` gy `` |
 | `goto_implementation` | Goto implementation | normal: `` gi ``, select: `` gi `` |
-| `goto_file_start` | Goto line number `<n>` else file start | normal: `` gg `` |
+| `goto_file_start` | Goto line number <n> else file start | normal: `` gg `` |
 | `goto_file_end` | Goto file end |  |
-| `extend_to_file_start` | Extend to line number `<n>` else file start | select: `` gg `` |
+| `extend_to_file_start` | Extend to line number<n> else file start | select: `` gg `` |
 | `extend_to_file_end` | Extend to file end |  |
 | `goto_file` | Goto files/URLs in selections | normal: `` gf ``, select: `` gf `` |
 | `goto_file_hsplit` | Goto files in selections (hsplit) | normal: `` <C-w>f ``, `` <space>wf ``, select: `` <C-w>f ``, `` <space>wf `` |
@@ -159,6 +166,11 @@
 | `goto_prev_change` | Goto previous change | normal: `` [g ``, select: `` [g `` |
 | `goto_first_change` | Goto first change | normal: `` [G ``, select: `` [G `` |
 | `goto_last_change` | Goto last change | normal: `` ]G ``, select: `` ]G `` |
+| `grow_buffer_width` | Grow focused container width | normal: `` <A-W>l ``, `` <A-w>l ``, `` <A-w><A-l> ``, `` <A-W><right> ``, `` <A-w><right> ``, `` <A-w><A-right> ``, select: `` <A-W>l ``, `` <A-w>l ``, `` <A-w><A-l> ``, `` <A-W><right> ``, `` <A-w><right> ``, `` <A-w><A-right> `` |
+| `shrink_buffer_width` | Shrink focused container width | normal: `` <A-W>h ``, `` <A-w>h ``, `` <A-w><A-h> ``, `` <A-W><left> ``, `` <A-w><left> ``, `` <A-w><A-left> ``, select: `` <A-W>h ``, `` <A-w>h ``, `` <A-w><A-h> ``, `` <A-W><left> ``, `` <A-w><left> ``, `` <A-w><A-left> `` |
+| `grow_buffer_height` | Grow focused container height | normal: `` <A-W>k ``, `` <A-w>k ``, `` <A-W><up> ``, `` <A-w><up> ``, `` <A-w><A-k> ``, `` <A-w><A-up> ``, select: `` <A-W>k ``, `` <A-w>k ``, `` <A-W><up> ``, `` <A-w><up> ``, `` <A-w><A-k> ``, `` <A-w><A-up> `` |
+| `shrink_buffer_height` | Shrink focused container height | normal: `` <A-W>j ``, `` <A-w>j ``, `` <A-w><A-j> ``, `` <A-W><down> ``, `` <A-w><down> ``, `` <A-w><A-down> ``, select: `` <A-W>j ``, `` <A-w>j ``, `` <A-w><A-j> ``, `` <A-W><down> ``, `` <A-w><down> ``, `` <A-w><A-down> `` |
+| `toggle_focus_window` | Toggle focus mode on buffer | normal: `` <A-W>f ``, `` <A-w>f ``, `` <A-w><A-f> ``, select: `` <A-W>f ``, `` <A-w>f ``, `` <A-w><A-f> `` |
 | `goto_line_start` | Goto line start | normal: `` gh ``, `` <home> ``, select: `` gh ``, insert: `` <home> `` |
 | `goto_line_end` | Goto line end | normal: `` gl ``, `` <end> ``, select: `` gl `` |
 | `goto_column` | Goto column | normal: `` g\| `` |
@@ -218,7 +230,7 @@
 | `remove_primary_selection` | Remove primary selection | normal: `` <A-,> ``, select: `` <A-,> `` |
 | `completion` | Invoke completion popup | insert: `` <C-x> `` |
 | `hover` | Show docs for item under cursor | normal: `` <space>k ``, select: `` <space>k `` |
-| `hover_dump` | Show docs for item under cursor in a new buffer | normal: `` <space>K ``, select: `` <space>K `` |
+| `goto_hover` | Show docs for item under cursor in a new buffer | normal: `` <space>K ``, select: `` <space>K `` |
 | `toggle_comments` | Comment/uncomment selections | normal: `` <C-c> ``, `` <space>c ``, select: `` <C-c> ``, `` <space>c `` |
 | `toggle_line_comments` | Line comment/uncomment selections | normal: `` <space><A-c> ``, select: `` <space><A-c> `` |
 | `toggle_block_comments` | Block comment/uncomment selections | normal: `` <space>C ``, select: `` <space>C `` |
@@ -341,3 +353,4 @@
 | `rotate_selections_last` | Make the last selection your primary one |  |
 | `fold` | Fold text objects | normal: `` Zf ``, `` zf ``, select: `` Zf ``, `` zf `` |
 | `unfold` | Unfold text objects | normal: `` ZF ``, `` zF ``, select: `` ZF ``, `` zF `` |
+| `toggle_fold` | Toggle fold for the text object at the primary cursor | normal: `` Z<A-f> ``, `` z<A-f> ``, select: `` Z<A-f> ``, `` z<A-f> `` |

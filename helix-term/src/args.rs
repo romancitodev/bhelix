@@ -13,15 +13,17 @@ pub struct Args {
     pub load_tutor: bool,
     pub fetch_grammars: bool,
     pub build_grammars: bool,
+    pub strict: bool,
     pub split: Option<Layout>,
     pub verbosity: u64,
     pub log_file: Option<PathBuf>,
     pub config_file: Option<PathBuf>,
-    pub files: IndexMap<PathBuf, Vec<Position>>,
+    pub files: IndexMap<PathBuf, Option<Vec<Position>>>,
     pub working_directory: Option<PathBuf>,
 }
 
 impl Args {
+    #[allow(clippy::too_many_lines)]
     pub fn parse_args() -> Result<Args> {
         let mut args = Args::default();
         let mut argv = std::env::args().peekable();
@@ -35,8 +37,12 @@ impl Args {
 
             args.files
                 .entry(filename)
-                .and_modify(|positions| positions.push(position))
-                .or_insert_with(|| vec![position]);
+                .and_modify(|positions| {
+                    if let (Some(positions), Some(position)) = (positions.as_mut(), position) {
+                        positions.push(position);
+                    }
+                })
+                .or_insert_with(|| position.map(|position| vec![position]));
         };
 
         argv.next(); // skip the program, we don't care about that
@@ -46,6 +52,7 @@ impl Args {
                 "--" => break, // stop parsing at this point treat the remaining as files
                 "--version" => args.display_version = true,
                 "--help" => args.display_help = true,
+                "--strict" => args.strict = true,
                 "--tutor" => args.load_tutor = true,
                 "--vsplit" => match args.split {
                     Some(_) => anyhow::bail!("can only set a split once of a specific type"),
@@ -119,12 +126,11 @@ impl Args {
         }
 
         if line_number != 0 {
-            if let Some(first_position) = args
-                .files
-                .first_mut()
-                .and_then(|(_, positions)| positions.first_mut())
-            {
-                first_position.row = line_number;
+            if let Some((_, positions)) = args.files.first_mut() {
+                let positions = positions.get_or_insert_with(|| vec![Position::default()]);
+                if let Some(first_position) = positions.first_mut() {
+                    first_position.row = line_number;
+                }
             }
         }
 
@@ -132,14 +138,20 @@ impl Args {
     }
 }
 
-/// Parse arg into [`PathBuf`] and position.
-pub(crate) fn parse_file(s: &str) -> (PathBuf, Position) {
-    let def = || (PathBuf::from(s), Position::default());
+/// Parse arg into [`PathBuf`] and optional position.
+///
+/// The position is `None` when the argument did not explicitly specify a
+/// line/column (e.g. `hx file.rs`), which lets features like persistent file
+/// positions restore the last location instead of being clobbered by a
+/// default `(0, 0)` position.
+pub(crate) fn parse_file(s: &str) -> (PathBuf, Option<Position>) {
+    let def = || (PathBuf::from(s), None);
     if Path::new(s).exists() {
         return def();
     }
     split_path_row_col(s)
         .or_else(|| split_path_row(s))
+        .map(|(path, pos)| (path, Some(pos)))
         .unwrap_or_else(def)
 }
 

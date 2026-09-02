@@ -9,17 +9,21 @@ use crate::{
     handlers::Handlers,
     info::Info,
     input::KeyEvent,
+    persistence::{self, FileHistoryEntry},
+    regex::EqRegex,
     register::Registers,
     theme::{self, Theme},
     tree::{self, Dimension, Resize, Tree},
+    view::ViewPosition,
     Document, DocumentId, View, ViewId,
 };
 use helix_event::dispatch;
-use helix_loader::workspace_trust::TrustStatus;
+use helix_loader::workspace_trust::{ImplicitTrustLevel, TrustQuery, WorkspaceTrust};
 use helix_vcs::DiffProviderRegistry;
+use regex::Regex;
 
 use futures_util::stream::select_all::SelectAll;
-use futures_util::{future, StreamExt};
+use futures_util::StreamExt;
 use helix_lsp::{Call, LanguageServerId};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -329,13 +333,51 @@ where
     Ok(chars)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct ScrolloffConfig {
+    pub horizontal: usize,
+    pub vertical: usize,
+}
+
+fn deserialize_scrolloff_config<'de, D>(deserializer: D) -> Result<ScrolloffConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum ScrolloffConfigDe {
+        Legacy(usize),
+        Split(ScrolloffConfig),
+    }
+
+    let scrolloff = ScrolloffConfigDe::deserialize(deserializer)?;
+    match scrolloff {
+        ScrolloffConfigDe::Legacy(u) => Ok(ScrolloffConfig {
+            horizontal: u,
+            vertical: u,
+        }),
+        ScrolloffConfigDe::Split(s) => Ok(s),
+    }
+}
+
+impl Default for ScrolloffConfig {
+    fn default() -> Self {
+        Self {
+            horizontal: 5,
+            vertical: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
     /// Whether to enable the welcome screen
     pub welcome_screen: bool,
     /// Padding to keep between the edge of the screen and the cursor when scrolling. Defaults to 5.
-    pub scrolloff: usize,
+    #[serde(deserialize_with = "deserialize_scrolloff_config")]
+    pub scrolloff: ScrolloffConfig,
     /// Number of lines to scroll at once. Defaults to 3
     pub scroll_lines: isize,
     /// Mouse support. Defaults to true.
@@ -413,6 +455,8 @@ pub struct Config {
     pub file_picker: FilePickerConfig,
     /// Configuration of the bufferline
     pub bufferline: BufferLineConfig,
+    /// Persistently display a breadcrumb navigation bar along the top of each view
+    pub breadcrumb: BreadcrumbConfig,
     /// Configuration of the file explorer
     pub file_explorer: FileExplorerConfig,
     /// Configuration of the statusline elements
@@ -500,6 +544,9 @@ pub struct Config {
     /// Picker gradient border configuration
     #[serde(default)]
     pub gradient_borders: GradientBorderConfig,
+    /// Whether to show pickers in fullscreen mode. When true, pickers expand to
+    /// full screen width on terminals narrower than 200 columns. Defaults to false.
+    pub fullscreen_overlay: bool,
     /// Notification system configuration
     #[serde(default)]
     pub notifications: NotificationConfig,
@@ -512,6 +559,87 @@ pub struct Config {
     pub fold_textobjects: Vec<String>,
     /// Whether to implicitly trust every workspace or not
     pub insecure: bool,
+    /// Workspace-trust configuration.
+    pub workspace_trust: WorkspaceTrustConfig,
+    /// Cross-session persistence of command/search history, clipboard, and file positions.
+    pub persistence: PersistenceConfig,
+}
+
+/// User-facing configuration for `[editor.workspace-trust]`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WorkspaceTrustConfig {
+    /// What to trust implicitly without an explicit grant. See [`ImplicitTrustLevelConfig`].
+    pub level: ImplicitTrustLevelConfig,
+    /// Whether opening a file in an untrusted workspace surfaces the trust modal. The statusline
+    /// `[⚠]` indicator is always shown either way; disabling the prompt is for users who would
+    /// rather act explicitly via `:workspace-trust` than be interrupted. Defaults to `true`.
+    pub prompt: bool,
+    /// Glob patterns whose matching workspaces are implicitly trusted.
+    pub trusted: Vec<String>,
+}
+
+impl Default for WorkspaceTrustConfig {
+    fn default() -> Self {
+        Self {
+            level: ImplicitTrustLevelConfig::default(),
+            prompt: true,
+            trusted: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImplicitTrustLevelConfig {
+    /// Don't trust anything implicitly — prompt for every new workspace.
+    None,
+    /// Trust Helix-launched server processes (LSP and DAP) implicitly. Workspace-local config and
+    /// git full-trust still require explicit `:workspace-trust`. This is the default — language
+    /// servers are configured globally, so auto-starting them in fresh workspaces matches user
+    /// expectations while the workspace-controlled `.helix/` config still requires opt-in.
+    #[default]
+    Servers,
+    /// Trust everything implicitly. Explicit excludes still win.
+    Insecure,
+}
+
+impl From<ImplicitTrustLevelConfig> for ImplicitTrustLevel {
+    fn from(v: ImplicitTrustLevelConfig) -> Self {
+        match v {
+            ImplicitTrustLevelConfig::None => ImplicitTrustLevel::None,
+            ImplicitTrustLevelConfig::Servers => ImplicitTrustLevel::Servers,
+            ImplicitTrustLevelConfig::Insecure => ImplicitTrustLevel::Insecure,
+        }
+    }
+}
+
+impl From<&WorkspaceTrustConfig> for helix_loader::workspace_trust::Config {
+    fn from(v: &WorkspaceTrustConfig) -> Self {
+        Self {
+            level: v.level.into(),
+            prompt: v.prompt,
+            trusted_globs: helix_loader::workspace_trust::build_trusted_globs(&v.trusted),
+        }
+    }
+}
+
+impl Config {
+    pub fn code_action_hint(&self) -> bool {
+        self.gutters.layout.contains(&GutterType::CodeActionHint)
+            || self
+                .statusline
+                .left
+                .contains(&StatusLineElement::CodeActionHint)
+            || self
+                .statusline
+                .center
+                .contains(&StatusLineElement::CodeActionHint)
+            || self
+                .statusline
+                .right
+                .contains(&StatusLineElement::CodeActionHint)
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1028,6 +1156,43 @@ impl Default for BufferLineConfig {
     }
 }
 
+/// How much path information is shown in the breadcrumb bar
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BreadcrumbPathOptions {
+    /// Show the full relative path before the symbols
+    #[default]
+    Full,
+    /// Show only the file name
+    File,
+    /// Show no path information
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct BreadcrumbConfig {
+    pub enable: bool,
+    pub path: BreadcrumbPathOptions,
+    /// Maximum number of symbol levels shown; when exceeded the outermost
+    /// symbols are elided with `…`. `0` means unlimited.
+    pub max_depth: usize,
+    /// Maximum length of a single crumb name; longer names are truncated in
+    /// the middle with `…`. `0` means unlimited.
+    pub max_name_length: usize,
+}
+
+impl Default for BreadcrumbConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            path: BreadcrumbPathOptions::Full,
+            max_depth: 8,
+            max_name_length: 32,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct StatusLineConfig {
@@ -1160,6 +1325,8 @@ pub enum StatusLineElement {
 
     /// The current function name (from tree-sitter)
     FunctionName,
+    /// Indicator for when code actions are available
+    CodeActionHint,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs
@@ -1250,6 +1417,8 @@ pub enum GutterType {
     Spacer,
     /// Highlight local changes
     Diff,
+    /// Indicator for when code actions are available
+    CodeActionHint,
 }
 
 impl std::str::FromStr for GutterType {
@@ -1261,6 +1430,7 @@ impl std::str::FromStr for GutterType {
             "spacer" => Ok(Self::Spacer),
             "line-numbers" => Ok(Self::LineNumbers),
             "diff" => Ok(Self::Diff),
+            "code-action-hint" => Ok(Self::CodeActionHint),
             _ => anyhow::bail!(
                 "Gutter type can only be `diagnostics`, `spacer`, `line-numbers` or `diff`."
             ),
@@ -1581,11 +1751,43 @@ impl Default for CompletionHighlight {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct PersistenceConfig {
+    pub old_files: bool,
+    pub commands: bool,
+    pub search: bool,
+    pub clipboard: bool,
+    pub old_files_exclusions: Vec<EqRegex>,
+    pub old_files_trim: usize,
+    pub commands_trim: usize,
+    pub search_trim: usize,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            old_files: false,
+            commands: false,
+            search: false,
+            clipboard: false,
+            // TODO: any more defaults we should add here?
+            old_files_exclusions: [r".*/\.git/.*", r".*/COMMIT_EDITMSG"]
+                .iter()
+                .map(|s| Regex::new(s).unwrap().into())
+                .collect(),
+            old_files_trim: 100,
+            commands_trim: 100,
+            search_trim: 100,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             welcome_screen: true,
-            scrolloff: 5,
+            scrolloff: ScrolloffConfig::default(),
             scroll_lines: 3,
             mouse: true,
             mouse_yank_register: '*',
@@ -1615,6 +1817,7 @@ impl Default for Config {
             auto_info: true,
             file_picker: FilePickerConfig::default(),
             bufferline: BufferLineConfig::default(),
+            breadcrumb: BreadcrumbConfig::default(),
             file_explorer: FileExplorerConfig::default(),
             statusline: StatusLineConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
@@ -1661,9 +1864,12 @@ impl Default for Config {
             gradient_borders: GradientBorderConfig::default(),
             notifications: NotificationConfig::default(),
             completion_highlight: CompletionHighlight::default(),
+            fullscreen_overlay: false,
             buffer_picker: BufferPickerConfig::default(),
             fold_textobjects: Vec::new(),
             insecure: false,
+            workspace_trust: WorkspaceTrustConfig::default(),
+            persistence: PersistenceConfig::default(),
         }
     }
 }
@@ -1764,6 +1970,18 @@ impl NotificationManager {
     }
 
     pub fn add(&mut self, mut notification: Notification) -> usize {
+        // Deduplicate: if an active notification with the same message and
+        // severity already exists, refresh its timestamp and return its id.
+        if let Some(existing) = self.notifications.iter_mut().find(|n| {
+            n.message == notification.message
+                && n.severity == notification.severity
+                && !n.dismissed
+                && !n.is_expired()
+        }) {
+            existing.timestamp = Instant::now();
+            return existing.id;
+        }
+
         notification.id = self.next_id;
         self.next_id += 1;
 
@@ -1885,6 +2103,9 @@ pub struct Editor {
 
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
+    pub workspace_trust: WorkspaceTrust,
+    /// File positions restored from / written to persistent state.
+    pub old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -1958,6 +2179,8 @@ impl Editor {
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
         config: Arc<dyn DynAccess<Config>>,
         handlers: Handlers,
+        workspace_trust: WorkspaceTrust,
+        old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
     ) -> Self {
         let language_servers = helix_lsp::Registry::new(syn_loader.clone());
         let conf = config.load();
@@ -2009,6 +2232,8 @@ impl Editor {
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
+            workspace_trust,
+            old_file_locs,
         }
     }
 
@@ -2388,6 +2613,96 @@ impl Editor {
         Ok(())
     }
 
+    pub fn create_path(&mut self, path: &Path, is_dir: bool) -> io::Result<()> {
+        let path = canonicalize(path);
+        let language_servers: Vec<_> = self
+            .language_servers
+            .iter_clients()
+            .filter(|client| client.is_initialized())
+            .cloned()
+            .collect();
+        for language_server in language_servers {
+            let Some(request) = language_server.will_create(&path, is_dir) else {
+                continue;
+            };
+            let edit = match helix_lsp::block_on(request) {
+                Ok(edit) => edit.unwrap_or_default(),
+                Err(err) => {
+                    log::error!("invalid willCreate response: {err:?}");
+                    continue;
+                }
+            };
+            if let Err(err) = self.apply_workspace_edit(language_server.offset_encoding(), &edit) {
+                log::error!("failed to apply workspace edit: {err:?}")
+            }
+        }
+
+        if let Some(dir) = path.parent() {
+            if !dir.is_dir() {
+                fs::create_dir_all(dir)?;
+            }
+        }
+        if is_dir {
+            fs::create_dir(&path)?;
+        } else {
+            fs::write(&path, [])?;
+        }
+
+        for ls in self.language_servers.iter_clients() {
+            if !ls.is_initialized() {
+                continue;
+            }
+            ls.did_create(&path, is_dir);
+        }
+        self.language_servers.file_event_handler.file_changed(path);
+        Ok(())
+    }
+
+    pub fn delete_path(&mut self, path: &Path, recursive: bool) -> io::Result<()> {
+        let path = canonicalize(path);
+        let is_dir = path.is_dir();
+        let language_servers: Vec<_> = self
+            .language_servers
+            .iter_clients()
+            .filter(|client| client.is_initialized())
+            .cloned()
+            .collect();
+        for language_server in language_servers {
+            let Some(request) = language_server.will_delete(&path, is_dir) else {
+                continue;
+            };
+            let edit = match helix_lsp::block_on(request) {
+                Ok(edit) => edit.unwrap_or_default(),
+                Err(err) => {
+                    log::error!("invalid willDelete response: {err:?}");
+                    continue;
+                }
+            };
+            if let Err(err) = self.apply_workspace_edit(language_server.offset_encoding(), &edit) {
+                log::error!("failed to apply workspace edit: {err:?}")
+            }
+        }
+
+        if is_dir {
+            if recursive {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_dir(&path)?;
+            }
+        } else {
+            fs::remove_file(&path)?;
+        }
+
+        for ls in self.language_servers.iter_clients() {
+            if !ls.is_initialized() {
+                continue;
+            }
+            ls.did_delete(&path, is_dir);
+        }
+        self.language_servers.file_event_handler.file_changed(path);
+        Ok(())
+    }
+
     pub fn set_doc_path(&mut self, doc_id: DocumentId, path: &Path) {
         let doc = doc_mut!(self, &doc_id);
         let old_path = doc.path();
@@ -2438,23 +2753,20 @@ impl Editor {
         let Some(doc_url) = doc.url() else {
             return;
         };
-        let (lang, path) = (doc.language.clone(), doc.path().cloned());
+        let (lang, path) = (doc.language.clone(), doc.path());
         let config = doc.config.load();
         let root_dirs = &config.workspace_lsp_roots;
 
-        if let TrustStatus::Untrusted =
-            helix_loader::workspace_trust::quick_query_workspace(self.config.load().insecure)
-        {
-            self.set_status(
-                "Current workspace is not trusted. Run `:workspace-trust` to enable all features.",
-            );
+        let workspace = doc.workspace_root();
+        let trust = self.workspace_trust.query(workspace, TrustQuery::Lsp);
+        if !trust.is_trusted() {
             return;
-        };
+        }
 
         // store only successfully started language servers
         let language_servers = lang.as_ref().map_or_else(HashMap::default, |language| {
             self.language_servers
-                .get(language, path.as_ref(), root_dirs, config.lsp.snippets)
+                .get(language, path, root_dirs, config.lsp.snippets)
                 .filter_map(|(lang, client)| match client {
                     Ok(client) => Some((lang, client)),
                     Err(err) => {
@@ -2598,7 +2910,7 @@ impl Editor {
                     }
                 } else {
                     let jump = (view.doc, doc.selection(view.id).clone());
-                    view.jumps.push(jump);
+                    view.push_jump(doc, jump);
                     // Set last accessed doc if it is a different document
                     if doc.id != id {
                         view.add_to_history(view.doc);
@@ -2728,9 +3040,11 @@ impl Editor {
         let path = helix_stdx::path::canonicalize(path);
         let id = self.document_id_by_path(&path);
 
+        let mut id_was_new = false;
         let id = if let Some(id) = id {
             id
         } else {
+            id_was_new = true;
             let mut doc = Document::open(
                 &path,
                 None,
@@ -2743,10 +3057,16 @@ impl Editor {
                 Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);
             doc.replace_diagnostics(diagnostics, &[], None);
 
-            if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
+            let trust_full = self
+                .workspace_trust
+                .query(doc.workspace_root(), TrustQuery::Git)
+                .is_trusted();
+            if let Some(diff_base) = self.diff_providers.get_diff_base(&path, trust_full) {
                 doc.set_diff_base(diff_base);
             }
-            doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
+            doc.set_version_control_head(
+                self.diff_providers.get_current_head_name(&path, trust_full),
+            );
 
             let id = self.new_document(doc);
 
@@ -2761,16 +3081,72 @@ impl Editor {
             id
         };
 
+        let new_doc = id_was_new;
         self.switch(id, action);
+
+        // Restore file position from persistent history when enabled.
+        // This needs to happen after switch, since switch messes with view offsets.
+        if new_doc
+            && self.config().persistence.old_files
+            && !self
+                .config()
+                .persistence
+                .old_files_exclusions
+                .iter()
+                .any(|r| r.is_match(&path.to_string_lossy()))
+        {
+            if let Some((view_position, selection)) =
+                self.old_file_locs.get(&path).map(|x| x.to_owned())
+            {
+                let (view, doc) = current!(self);
+
+                let doc_len = doc.text().len_chars();
+                // Don't restore if selection goes beyond the file's end
+                if !selection.ranges().iter().any(|range| range.to() > doc_len) {
+                    doc.set_view_offset(view.id, view_position);
+                    doc.set_selection(view.id, selection);
+                }
+            }
+        }
 
         Ok(id)
     }
 
     pub fn close(&mut self, id: ViewId) {
-        // Remove selections for the closed view on all documents.
+        let mut file_locs = Vec::new();
+
         for doc in self.documents_mut() {
+            // Persist file location history for this view
+            if doc.selections().contains_key(&id) {
+                if let Some(path) = doc.path() {
+                    file_locs.push(FileHistoryEntry::new(
+                        path.to_path_buf(),
+                        doc.view_offset(id),
+                        doc.selection(id).clone(),
+                    ));
+                }
+            }
+
+            // Remove selections for the closed view on all documents.
             doc.remove_view(id);
         }
+
+        if self.config().persistence.old_files {
+            for loc in file_locs {
+                if !self
+                    .config()
+                    .persistence
+                    .old_files_exclusions
+                    .iter()
+                    .any(|r| r.is_match(&loc.path.to_string_lossy()))
+                {
+                    persistence::push_file_history(&loc);
+                    self.old_file_locs
+                        .insert(loc.path, (loc.view_position, loc.selection));
+                }
+            }
+        }
+
         self.tree.remove(id);
         self._refresh();
     }
@@ -2792,6 +3168,8 @@ impl Editor {
             ReplaceDoc(ViewId, DocumentId),
         }
 
+        let mut file_locs = Vec::new();
+
         let actions: Vec<Action> = self
             .tree
             .views_mut()
@@ -2799,6 +3177,14 @@ impl Editor {
                 view.remove_document(&doc_id);
 
                 if view.doc == doc_id {
+                    if let Some(path) = doc.path() {
+                        file_locs.push(FileHistoryEntry::new(
+                            path.to_path_buf(),
+                            doc.view_offset(view.id),
+                            doc.selection(view.id).clone(),
+                        ));
+                    }
+
                     // something was previously open in the view, switch to previous doc
                     if let Some(prev_doc) = view.docs_access_history.pop() {
                         Some(Action::ReplaceDoc(view.id, prev_doc))
@@ -2811,6 +3197,22 @@ impl Editor {
                 }
             })
             .collect();
+
+        if self.config().persistence.old_files {
+            for loc in file_locs {
+                if !self
+                    .config()
+                    .persistence
+                    .old_files_exclusions
+                    .iter()
+                    .any(|r| r.is_match(&loc.path.to_string_lossy()))
+                {
+                    persistence::push_file_history(&loc);
+                    self.old_file_locs
+                        .insert(loc.path, (loc.view_position, loc.selection));
+                }
+            }
+        }
 
         for action in actions {
             match action {
@@ -2988,12 +3390,12 @@ impl Editor {
 
     pub fn document_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&Document> {
         self.documents()
-            .find(|doc| doc.path().map(|p| p == path.as_ref()).unwrap_or(false))
+            .find(|doc| doc.path().is_some_and(|p| p == path.as_ref()))
     }
 
     pub fn document_by_path_mut<P: AsRef<Path>>(&mut self, path: P) -> Option<&mut Document> {
         self.documents_mut()
-            .find(|doc| doc.path().map(|p| p == path.as_ref()).unwrap_or(false))
+            .find(|doc| doc.path().is_some_and(|p| p == path.as_ref()))
     }
 
     /// Returns all supported diagnostics for the document
@@ -3067,10 +3469,7 @@ impl Editor {
 
     /// Closes language servers with timeout. The default timeout is 10000 ms, use
     /// `timeout` parameter to override this.
-    pub async fn close_language_servers(
-        &self,
-        timeout: Option<u64>,
-    ) -> Result<(), tokio::time::error::Elapsed> {
+    pub async fn close_language_servers(&self, timeout: Option<u64>) {
         // Remove all language servers from the file event handler.
         // Note: this is non-blocking.
         for client in self.language_servers.iter_clients() {
@@ -3079,16 +3478,24 @@ impl Editor {
                 .remove_client(client.id());
         }
 
-        tokio::time::timeout(
-            Duration::from_millis(timeout.unwrap_or(3000)),
-            future::join_all(
-                self.language_servers
-                    .iter_clients()
-                    .map(|client| client.force_shutdown()),
-            ),
-        )
-        .await
-        .map(|_| ())
+        // Enqueue shutdown+exit for every server (non-blocking fire-and-forget).
+        for client in self.language_servers.iter_clients() {
+            client.force_shutdown();
+        }
+
+        // Wait until shutdown+exit have actually been written to each server's stdin
+        // before the runtime (and the pipes) are torn down, so well-behaved servers
+        // can act on `exit` before kill_on_drop reaps them. This waits only on our
+        // own outbound write -- not on any server response -- so a slow server (e.g.
+        // gopls flushing logs) doesn't delay it. Capped so a wedged write can't hang
+        // the quit.
+        let cap = Duration::from_millis(timeout.unwrap_or(1000));
+        let _ = tokio::time::timeout(cap, async {
+            for client in self.language_servers.iter_clients() {
+                client.wait_shutdown_flushed().await;
+            }
+        })
+        .await;
     }
 
     pub async fn wait_event(&mut self) -> EditorEvent {
@@ -3230,11 +3637,13 @@ impl Editor {
 
     pub fn jump_backward(&mut self, view_id: ViewId, count: usize) {
         let view = view_mut!(self, view_id);
-        if let Some((doc_id, selection)) = view
-            .jumps
-            .backward(view_id, doc_mut!(self, &view.doc), count)
-            .cloned()
-        {
+        let doc = doc_mut!(self, &view.doc);
+        // `backward` may push the current selection (valid at the document's
+        // current revision) onto the jumplist. Sync first so the view's
+        // `doc_revisions` matches, otherwise that entry would be left ahead of
+        // it and a later sync would map it out of bounds.
+        view.sync_changes(doc);
+        if let Some((doc_id, selection)) = view.jumps.backward(view_id, doc, count).cloned() {
             self.jump_to(view_id, doc_id, selection);
         }
     }

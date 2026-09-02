@@ -14,6 +14,7 @@ use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
 use helix_core::text_folding::{EndFoldPoint, FoldContainer, StartFoldPoint};
 use helix_event::TaskController;
+use helix_lsp::lsp::DocumentSymbol;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
@@ -25,7 +26,7 @@ use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::io;
@@ -173,12 +174,24 @@ pub struct Document {
     fold_container: HashMap<ViewId, FoldContainer>,
     /// LSP document highlights for each view, stored as char ranges.
     pub(crate) document_highlights: HashMap<ViewId, DocumentHighlights>,
+    /// LSP code action hints for each view.
+    pub(crate) code_action_hints: HashSet<ViewId>,
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
     /// update from the LSP
     pub inlay_hints_oudated: bool,
 
+    // Stores all the symbols of the Document.
+    pub(crate) symbols: Option<DocumentSymbolCache>,
+    /// Breadcrumb trail for each view showing this document.
+    pub breadcrumbs: HashMap<ViewId, Breadcrumbs>,
+
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
+    /// Lazily-computed workspace root for this document (the ancestor that contains a `.git` /
+    /// `.svn` / `.jj` / `.helix`). Avoids per-call `find_workspace_in` ancestor walks for hot
+    /// consumers like the statusline trust indicator, LSP launch, and DAP launch. Taken in
+    /// `set_path` so save-as recomputes.
+    workspace_root: OnceCell<PathBuf>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -242,8 +255,11 @@ pub struct Document {
     pub color_swatch_controller: TaskController,
     /// Per-view task controllers for canceling in-flight document highlight requests.
     pub document_highlight_controllers: HashMap<ViewId, TaskController>,
+    /// Per-view task controllers for canceling in-flight code action requests.
+    pub code_action_controllers: HashMap<ViewId, TaskController>,
     pub pull_diagnostic_controller: TaskController,
     pub document_link_controller: TaskController,
+    pub document_symbols_controller: TaskController,
 
     /// Whether to render the welcome screen when opening the document
     pub is_welcome: bool,
@@ -260,6 +276,170 @@ pub struct DocumentColorSwatches {
     pub color_swatches: Vec<InlineAnnotation>,
     pub colors: Vec<syntax::Highlight>,
     pub color_swatches_padding: Vec<InlineAnnotation>,
+}
+
+pub struct DocumentSymbolCache {
+    pub tree: Vec<ThinDocumentSymbol>,
+    pub offset_encoding: OffsetEncoding,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinDocumentSymbol {
+    pub name: Box<str>,
+    pub kind: lsp::SymbolKind,
+    pub range: lsp::Range,
+    pub children: Option<Box<[Self]>>,
+}
+
+impl From<DocumentSymbol> for ThinDocumentSymbol {
+    #[inline]
+    fn from(symbol: DocumentSymbol) -> Self {
+        Self {
+            name: symbol.name.into(),
+            kind: symbol.kind,
+            range: symbol.range,
+            children: symbol.children.map(|children| {
+                let mut vec = Vec::with_capacity(children.len());
+                vec.extend(children.into_iter().map(Self::from));
+                vec.into_boxed_slice()
+            }),
+        }
+    }
+}
+
+impl ThinDocumentSymbol {
+    fn contains(outer: &lsp::Range, inner: &lsp::Range) -> bool {
+        outer.start <= inner.start && inner.end <= outer.end
+    }
+
+    /// Build a hierarchy from a flat list of symbols (e.g. tree-sitter tags or
+    /// an LSP `DocumentSymbolResponse::Flat`) by nesting each symbol inside the
+    /// nearest preceding symbol whose range contains it.
+    pub fn nest_flat(mut symbols: Vec<Self>) -> Vec<Self> {
+        if symbols.is_empty() {
+            return symbols;
+        }
+
+        // Sort by start position; on ties the larger (outer) range first so
+        // that containment forms a proper tree.
+        symbols.sort_by(|a, b| {
+            a.range
+                .start
+                .cmp(&b.range.start)
+                .then_with(|| b.range.end.cmp(&a.range.end))
+        });
+
+        fn finish(
+            symbol: ThinDocumentSymbol,
+            children: Vec<ThinDocumentSymbol>,
+        ) -> ThinDocumentSymbol {
+            let mut symbol = symbol;
+            symbol.children = (!children.is_empty()).then(|| children.into_boxed_slice());
+            symbol
+        }
+
+        let mut roots: Vec<ThinDocumentSymbol> = Vec::new();
+        // Stack of symbols whose range contains every subsequently seen range,
+        // accumulating their children as they are discovered.
+        let mut stack: Vec<(ThinDocumentSymbol, Vec<ThinDocumentSymbol>)> = Vec::new();
+
+        for symbol in symbols {
+            loop {
+                match stack.last() {
+                    Some((top, _)) if Self::contains(&top.range, &symbol.range) => break,
+                    None => break,
+                    Some(_) => {}
+                }
+                let (sym, children) = stack.pop().expect("stack is non-empty here");
+                let sym = finish(sym, children);
+                match stack.last_mut() {
+                    Some((_, siblings)) => siblings.push(sym),
+                    None => roots.push(sym),
+                }
+            }
+            stack.push((symbol, Vec::new()));
+        }
+
+        while let Some((sym, children)) = stack.pop() {
+            let sym = finish(sym, children);
+            match stack.last_mut() {
+                Some((_, siblings)) => siblings.push(sym),
+                None => roots.push(sym),
+            }
+        }
+
+        roots
+    }
+}
+
+/// Breadcrumb trail of symbols leading to the cursor, outermost first.
+#[derive(Debug, Clone, Default)]
+pub struct Breadcrumbs {
+    crumbs: Vec<Crumb>,
+    /// Whether outermost symbols were dropped to honor `breadcrumb.max-depth`.
+    elided: bool,
+}
+
+impl Breadcrumbs {
+    #[inline]
+    pub fn push(&mut self, crumb: Crumb) {
+        self.crumbs.push(crumb);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.crumbs.clear();
+        self.elided = false;
+    }
+
+    /// Drop the outermost symbols beyond `max_depth`, marking the trail as elided.
+    #[inline]
+    pub fn truncate_depth(&mut self, max_depth: usize) {
+        if max_depth != 0 && self.crumbs.len() > max_depth {
+            let excess = self.crumbs.len() - max_depth;
+            self.crumbs.drain(0..excess);
+            self.elided = true;
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.crumbs.is_empty()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn depth(&self) -> usize {
+        self.crumbs.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn elided(&self) -> bool {
+        self.elided
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Crumb> {
+        self.crumbs.iter()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Crumb {
+    pub name: Box<str>,
+    pub kind: lsp::SymbolKind,
+}
+
+impl From<&ThinDocumentSymbol> for Crumb {
+    #[inline]
+    fn from(symbol: &ThinDocumentSymbol) -> Self {
+        Self {
+            name: symbol.name.clone(),
+            kind: symbol.kind,
+        }
+    }
 }
 
 /// Highlight ranges returned by LSP `textDocument/documentHighlight` for a view.
@@ -745,8 +925,8 @@ where
     *mut_ref = f(mem::take(mut_ref));
 }
 
-use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName};
-use url::Url;
+use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName, OffsetEncoding};
+use helix_stdx::Url;
 
 impl Document {
     pub fn from(
@@ -765,6 +945,7 @@ impl Document {
             active_snippet: None,
             path: None,
             relative_path: OnceCell::new(),
+            workspace_root: OnceCell::new(),
             encoding,
             has_bom,
             text,
@@ -797,6 +978,7 @@ impl Document {
             jump_labels: HashMap::new(),
             plugin_annotations: HashMap::new(),
             document_highlights: HashMap::new(),
+            code_action_hints: HashSet::new(),
             color_swatches: None,
             document_links: Vec::new(),
             color_swatch_controller: TaskController::new(),
@@ -804,10 +986,14 @@ impl Document {
             file_blame: None,
             is_blame_potentially_out_of_date: false,
             document_highlight_controllers: HashMap::new(),
+            code_action_controllers: HashMap::new(),
             syn_loader,
             previous_diagnostic_ids: HashMap::new(),
             pull_diagnostic_controller: TaskController::new(),
             document_link_controller: TaskController::new(),
+            symbols: None,
+            document_symbols_controller: TaskController::new(),
+            breadcrumbs: HashMap::new(),
         }
     }
 
@@ -1333,6 +1519,7 @@ impl Document {
         &mut self,
         view: &mut View,
         provider_registry: &DiffProviderRegistry,
+        trust_full: bool,
     ) -> Result<(), Error> {
         let encoding = self.encoding;
         let path = match self.path() {
@@ -1359,12 +1546,12 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
-        match provider_registry.get_diff_base(&path) {
+        match provider_registry.get_diff_base(&path, trust_full) {
             Some(diff_base) => self.set_diff_base(diff_base),
             None => self.diff_handle = None,
         }
 
-        self.version_control_head = provider_registry.get_current_head_name(&path);
+        self.version_control_head = provider_registry.get_current_head_name(&path, trust_full);
 
         Ok(())
     }
@@ -1393,6 +1580,8 @@ impl Document {
         // `take` to remove any prior relative path that may have existed.
         // This will get set in `relative_path()`.
         self.relative_path.take();
+        // Same story: invalidate so the next workspace_root() recomputes against the new path.
+        self.workspace_root.take();
 
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
@@ -1492,6 +1681,10 @@ impl Document {
         }
 
         self.view_data_mut(view_id);
+
+        if self.config.load().breadcrumb.enable {
+            self.update_breadcrumbs_for_view(view_id);
+        }
     }
 
     /// Mark document as recent used for MRU sorting
@@ -1502,10 +1695,14 @@ impl Document {
     /// Remove a view's selection and inlay hints from this document.
     pub fn remove_view(&mut self, view_id: ViewId) {
         self.selections.remove(&view_id);
+        self.view_data.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
+        self.breadcrumbs.remove(&view_id);
         self.document_highlights.remove(&view_id);
         self.document_highlight_controllers.remove(&view_id);
+        self.code_action_hints.remove(&view_id);
+        self.code_action_controllers.remove(&view_id);
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
@@ -2043,6 +2240,23 @@ impl Document {
         self.language.as_deref()
     }
 
+    /// The language configuration of the injection layer at `byte_pos`,
+    /// so language-specific behavior follows embedded languages. Falls back to the
+    /// document's root language config when there is no syntax tree.
+    pub fn language_config_at<'a>(
+        &'a self,
+        loader: &'a syntax::Loader,
+        byte_pos: usize,
+    ) -> Option<&'a LanguageConfiguration> {
+        match self.syntax() {
+            Some(syntax) => {
+                let layer = syntax.layer_for_byte_range(byte_pos as u32, byte_pos as u32);
+                Some(&**loader.language(syntax.layer(layer).language).config())
+            }
+            None => self.language_config(),
+        }
+    }
+
     /// Current document version, incremented at each change.
     pub fn version(&self) -> i32 {
         self.version
@@ -2099,6 +2313,12 @@ impl Document {
 
     pub fn supports_language_server(&self, id: LanguageServerId) -> bool {
         self.language_servers().any(|l| l.id() == id)
+    }
+
+    pub fn servers_to_load(&self) -> bool {
+        self.language_config()
+            .map(|lang| !lang.language_servers.is_empty() || lang.debugger.is_some())
+            .unwrap_or(false)
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
@@ -2172,8 +2392,8 @@ impl Document {
 
     #[inline]
     /// File path on disk.
-    pub fn path(&self) -> Option<&PathBuf> {
-        self.path.as_ref()
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// File path as a URL.
@@ -2182,7 +2402,7 @@ impl Document {
     }
 
     pub fn uri(&self) -> Option<helix_core::Uri> {
-        Some(self.path()?.clone().into())
+        Some(self.path()?.into())
     }
 
     #[inline]
@@ -2230,6 +2450,20 @@ impl Document {
                     .map(|path| helix_stdx::path::get_relative_path(path).to_path_buf())
             })
             .as_deref()
+    }
+
+    /// The workspace root for this document — the nearest ancestor that contains a `.git`, `.svn`,
+    /// `.jj`, or `.helix`. Falls back to the current working directory's workspace when the
+    /// document has no path (scratch buffers). Lazily memoised on first call.
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace_root
+            .get_or_init(|| match self.path.as_deref() {
+                Some(p) => p
+                    .parent()
+                    .map(|dir| helix_loader::find_workspace_in(dir).0)
+                    .unwrap_or_else(|| helix_loader::find_workspace().0),
+                None => helix_loader::find_workspace().0,
+            })
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
@@ -2519,6 +2753,121 @@ impl Document {
         self.jump_labels.remove(&view_id);
     }
 
+    #[inline]
+    pub fn set_document_symbols(
+        &mut self,
+        symbols: Vec<DocumentSymbol>,
+        offset_encoding: OffsetEncoding,
+    ) {
+        self.symbols = Some(DocumentSymbolCache {
+            tree: symbols.into_iter().map(ThinDocumentSymbol::from).collect(),
+            offset_encoding,
+        });
+    }
+
+    /// Store a pre-built symbol tree (used by the tree-sitter fallback).
+    #[inline]
+    pub fn set_symbol_tree(
+        &mut self,
+        tree: Vec<ThinDocumentSymbol>,
+        offset_encoding: OffsetEncoding,
+    ) {
+        self.symbols = Some(DocumentSymbolCache {
+            tree,
+            offset_encoding,
+        });
+    }
+
+    #[inline]
+    pub fn clear_document_symbols(&mut self) {
+        self.symbols = None;
+        self.clear_breadcrumbs();
+    }
+
+    #[inline]
+    pub fn clear_breadcrumbs(&mut self) {
+        self.breadcrumbs.clear();
+    }
+
+    // For all non-hotpaths, we use this function to prevent code bloat.
+    #[inline(never)]
+    pub fn update_breadcrumbs_for_view(&mut self, view_id: ViewId) {
+        self.update_breadcrumbs_for_view_inlined(view_id);
+    }
+
+    // We want to make sure this is inlined in the hotpath (cursor position change).
+    #[inline(always)]
+    pub fn update_breadcrumbs_for_view_inlined(&mut self, view_id: ViewId) {
+        #[inline(always)]
+        const fn in_range(pos: lsp::Position, range: lsp::Range) -> bool {
+            // PERF:
+            // Line-based filtering is the most effective early exit indicator,
+            // so do first, before other evaluations; this should be friendly to
+            // the CPU branch predictor.
+            if pos.line < range.start.line || pos.line > range.end.line {
+                return false;
+            }
+
+            // Check if the cursor position is "in" the symbols "depth".
+            //
+            // In the context of breadcrumbs, this would be the difference between
+            // if the cursor is in an impl block or in an impl block and in a
+            // function of the impl block (`|` is the cursor):
+            //
+            // ```rust
+            // impl Foo {
+            //     f|n bar() {} // In `bar`: impl Foo > bar
+            //
+            //   | fn baz() {} // Not in `baz`: impl Foo
+            //
+            //     fn quux() {} | // Not in `quux`: impl Foo
+            // }
+            // ```
+            if pos.line == range.start.line && pos.character < range.start.character {
+                return false;
+            }
+            if pos.line == range.end.line && pos.character > range.end.character {
+                return false;
+            }
+
+            true
+        }
+
+        let Some(symbols) = self.symbols.as_ref() else {
+            return;
+        };
+
+        // The view may not have been initialized for this document yet.
+        if !self.selections.contains_key(&view_id) {
+            return;
+        }
+
+        let position = self.position(view_id, symbols.offset_encoding);
+
+        let max_depth = self.config.load().breadcrumb.max_depth;
+
+        let breadcrumb = {
+            let breadcrumb = self.breadcrumbs.entry(view_id).or_default();
+            breadcrumb.clear();
+            breadcrumb
+        };
+
+        let mut current = symbols.tree.as_slice();
+
+        while let Some(symbol) = current
+            .iter()
+            .find(|&symbol| in_range(position, symbol.range))
+        {
+            breadcrumb.push(Crumb::from(symbol));
+            match symbol.children.as_deref() {
+                Some(children) => current = children,
+                _ => break,
+            }
+        }
+
+        breadcrumb.truncate_depth(max_depth);
+    }
+
     pub fn set_document_highlights(
         &mut self,
         view_id: ViewId,
@@ -2551,6 +2900,27 @@ impl Document {
         self.document_highlight_controllers
             .entry(view_id)
             .or_default()
+    }
+
+    pub fn set_code_action_hints(&mut self, view_id: ViewId) {
+        self.code_action_hints.insert(view_id);
+    }
+
+    pub fn clear_code_action_hints(&mut self, view_id: ViewId) {
+        self.code_action_hints.remove(&view_id);
+    }
+
+    pub fn clear_all_code_action_hints(&mut self) {
+        self.code_action_hints.clear();
+        self.code_action_controllers.clear();
+    }
+
+    pub fn code_action_hints(&self, view_id: ViewId) -> bool {
+        self.code_action_hints.contains(&view_id)
+    }
+
+    pub fn code_action_controller(&mut self, view_id: ViewId) -> &mut TaskController {
+        self.code_action_controllers.entry(view_id).or_default()
     }
 
     /// Get the inlay hints for this document and `view_id`.
@@ -2897,4 +3267,116 @@ mod test {
     decode!(jis0212_decode, "jis0212", "EUC-JP");
     decode!(shift_jis_decode, "shift_jis");
     encode!(shift_jis_encode, "shift_jis");
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    use super::{Breadcrumbs, Crumb, ThinDocumentSymbol};
+    use helix_lsp::lsp;
+
+    fn symbol(name: &str, start: (u32, u32), end: (u32, u32)) -> ThinDocumentSymbol {
+        ThinDocumentSymbol {
+            name: name.into(),
+            kind: lsp::SymbolKind::FUNCTION,
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: lsp::Position {
+                    line: end.0,
+                    character: end.1,
+                },
+            },
+            children: None,
+        }
+    }
+
+    #[test]
+    fn nest_flat_builds_hierarchy_by_containment() {
+        // mod a { fn b() { } }  fn c() {}
+        let flat = vec![
+            symbol("c", (1, 0), (1, 8)),
+            symbol("b", (0, 9), (0, 15)),
+            symbol("a", (0, 0), (0, 18)),
+        ];
+
+        let tree = ThinDocumentSymbol::nest_flat(flat);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].name.as_ref(), "a");
+        let children = tree[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name.as_ref(), "b");
+        assert!(children[0].children.is_none());
+        assert_eq!(tree[1].name.as_ref(), "c");
+    }
+
+    #[test]
+    fn nest_flat_prefers_outer_range_on_tie() {
+        // Two symbols starting at the same position: the wider one is the parent.
+        let flat = vec![
+            symbol("inner", (0, 0), (0, 5)),
+            symbol("outer", (0, 0), (0, 9)),
+        ];
+
+        let tree = ThinDocumentSymbol::nest_flat(flat);
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name.as_ref(), "outer");
+        assert_eq!(tree[0].children.as_ref().unwrap()[0].name.as_ref(), "inner");
+    }
+
+    #[test]
+    fn truncate_depth_keeps_deepest_and_marks_elided() {
+        let mut crumbs = Breadcrumbs::default();
+        for i in 0..5 {
+            crumbs.push(Crumb {
+                name: format!("s{i}").into(),
+                kind: lsp::SymbolKind::FUNCTION,
+            });
+        }
+        assert!(!crumbs.elided());
+
+        crumbs.truncate_depth(3);
+
+        assert!(crumbs.elided());
+        assert_eq!(crumbs.depth(), 3);
+        let names: Vec<_> = crumbs.iter().map(|c| &*c.name).collect();
+        assert_eq!(names, ["s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn truncate_depth_zero_is_unlimited() {
+        let mut crumbs = Breadcrumbs::default();
+        for i in 0..5 {
+            crumbs.push(Crumb {
+                name: format!("s{i}").into(),
+                kind: lsp::SymbolKind::FUNCTION,
+            });
+        }
+
+        crumbs.truncate_depth(0);
+
+        assert!(!crumbs.elided());
+        assert_eq!(crumbs.depth(), 5);
+    }
+
+    #[test]
+    fn clear_resets_elided_flag() {
+        let mut crumbs = Breadcrumbs::default();
+        for i in 0..5 {
+            crumbs.push(Crumb {
+                name: format!("s{i}").into(),
+                kind: lsp::SymbolKind::FUNCTION,
+            });
+        }
+        crumbs.truncate_depth(2);
+        assert!(crumbs.elided());
+
+        crumbs.clear();
+
+        assert!(!crumbs.elided());
+        assert!(crumbs.is_empty());
+    }
 }

@@ -19,7 +19,7 @@ use helix_core::{
 use helix_view::{
     editor::CmdlineStyle,
     graphics::{CursorKind, Margin, Rect},
-    Editor,
+    persistence, Editor,
 };
 
 type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context)>;
@@ -629,7 +629,7 @@ impl Prompt {
                 surface.set_string(
                     self.line_area.x,
                     self.line_area.y,
-                    suggestion,
+                    &suggestion,
                     suggestion_color,
                 );
             }
@@ -714,6 +714,9 @@ impl Component for Prompt {
             }
             Event::Key(event) => *event,
             Event::Resize(..) => return EventResult::Consumed(None),
+            // Prompt is a modal and should consume mouse events so clicks don't fall
+            // through to the editor underneath
+            Event::Mouse(_) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
 
@@ -795,6 +798,11 @@ impl Component for Prompt {
                                     cx.editor.registers.push(register, self.line.clone())
                                 {
                                     cx.editor.set_error(err.to_string());
+                                }
+                                if (cx.editor.config().persistence.commands && register == ':')
+                                    || (cx.editor.config().persistence.search && register == '/')
+                                {
+                                    persistence::push_reg_history(register, &self.line);
                                 }
                             };
                         }
